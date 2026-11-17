@@ -37,6 +37,8 @@ class Check(BaseCheck):
         description: Optional[str] = None,
         statistics: Optional[Dict[str, Any]] = None,
         strategy: Optional[Any] = None,
+        *,
+        where: Optional[Callable] = None,
         **check_kwargs,
     ) -> None:
         """Apply a validation function to a data object.
@@ -101,6 +103,20 @@ class Check(BaseCheck):
         :param strategy: A hypothesis strategy, used for implementing data
             synthesis strategies for this check. See the
             :ref:`User Guide <custom-strategies>` for more details.
+        :param where: keyword-only optional callable that restricts the check
+            to a subset of rows. It receives the full, preprocessed
+            ``pandas.DataFrame`` (schema-level parsers, default values and
+            dtype coercion already applied; column checks can read other
+            columns) and must return a boolean or pandas nullable boolean
+            ``Series`` with the same length and index as the input. The mask
+            is interpreted positionally; ``NA`` in a nullable boolean series
+            means "not selected". Rows not selected by the mask are not
+            passed to ``check_fn`` and cannot fail the check. The callable is
+            evaluated at most once per ``validate`` call and is never passed
+            to ``check_fn`` as a keyword argument. ``where`` is only
+            supported for pandas ``DataFrameSchema`` table-level checks and
+            ``Column`` column-level checks; combining it with ``groupby``
+            raises a :class:`~pandera.errors.SchemaDefinitionError`.
         :param check_kwargs: key-word arguments to pass into ``check_fn``
 
         :example:
@@ -169,8 +185,20 @@ class Check(BaseCheck):
             raise errors.SchemaInitError(
                 "Cannot use groupby when element_wise=True."
             )
+        if where is not None and not callable(where):
+            raise ValueError(
+                "`where` must be a callable that accepts the full "
+                f"DataFrame and returns a boolean Series, got {type(where)}"
+            )
+        if where is not None and groupby is not None:
+            raise errors.SchemaDefinitionError(
+                "`where` and `groupby` cannot be used on the same Check. "
+                "Apply the row selection inside the groupby callable or "
+                "use separate checks instead."
+            )
         self._check_fn = check_fn
         self._check_kwargs = check_kwargs
+        self.where = where
         self.element_wise = element_wise
         self.name = name or getattr(
             self._check_fn, "__name__", self._check_fn.__class__.__name__
@@ -202,6 +230,11 @@ class Check(BaseCheck):
         self,
         check_obj: Any,
         column: Optional[str] = None,
+        validation_context: Optional[Any] = None,
+        head: Optional[int] = None,
+        tail: Optional[int] = None,
+        sample: Optional[int] = None,
+        random_state: Optional[int] = None,
     ) -> CheckResult:
         # pylint: disable=too-many-branches
         """Validate DataFrame or Series.
@@ -209,6 +242,13 @@ class Check(BaseCheck):
         :param check_obj: DataFrame of Series to validate.
         :param column: for dataframe checks, apply the check function to this
             column.
+        :param validation_context: per-validation bookkeeping object used by
+            conditional (``where``) checks. ``None`` for schemas without
+            ``where`` checks.
+        :param head: sample the first n rows of the checked object.
+        :param tail: sample the last n rows of the checked object.
+        :param sample: sample n random rows of the checked object.
+        :param random_state: random seed for ``sample``.
         :returns: CheckResult tuple containing:
 
             ``check_output``: boolean scalar, ``Series`` or ``DataFrame``
@@ -231,7 +271,15 @@ class Check(BaseCheck):
             # check.
             self._check_fn = self.get_builtin_check_fn(self.name)
         backend = self.get_backend(check_obj)(self)
-        return backend(check_obj, column)
+        return backend(
+            check_obj,
+            column,
+            validation_context=validation_context,
+            head=head,
+            tail=tail,
+            sample=sample,
+            random_state=random_state,
+        )
 
     @classmethod
     def equal_to(cls, value: Any, **kwargs) -> "Check":

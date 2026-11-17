@@ -130,7 +130,19 @@ class PolarsCheckBackend(BaseCheckBackend):
         self,
         check_obj: pl.LazyFrame,
         key: Optional[str] = None,
+        validation_context=None,
+        head=None,
+        tail=None,
+        sample=None,
+        random_state=None,
     ) -> CheckResult:
+        if getattr(self.check, "where", None) is not None:
+            from pandera.errors import SchemaDefinitionError
+
+            raise SchemaDefinitionError(
+                "The `where` argument of Check is only supported for pandas "
+                "DataFrame backends, not polars."
+            )
         check_obj = self.preprocess(check_obj, key)
         polars_data = PolarsData(check_obj, key or "*")
         check_output = self.apply(polars_data)

@@ -1,8 +1,9 @@
 """Check backend for pandas."""
 
 from functools import partial
-from typing import Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, Union, cast
 
+import numpy as np
 import pandas as pd
 
 from pandera.api.base.checks import CheckResult
@@ -81,7 +82,7 @@ class PandasCheckBackend(BaseCheckBackend):
     def preprocess(self, check_obj, key) -> pd.Series:
         """Preprocesses a check object before applying the check function."""
         # This handles the case of Series validation, which has no other context except
-        # for the index to groupby on. Right now grouping by the index is not allowed.
+        # for groupby on the index to groupby on. Right now grouping by the index is not allowed.
         if is_field(check_obj):
             return self.preprocess_field(check_obj)
         elif is_table(check_obj) and key is None:
@@ -340,11 +341,395 @@ class PandasCheckBackend(BaseCheckBackend):
             None,
         )
 
+    # ------------------------------------------------------------------
+    # Conditional (`where`) validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _as_bool_series(check_output: pd.Series) -> pd.Series:
+        if isinstance(check_output.dtype, pd.BooleanDtype):
+            return check_output.fillna(False).astype(bool)
+        if check_output.dtype != np.dtype("bool"):
+            return check_output.astype(bool)
+        return check_output
+
+    @staticmethod
+    def _bad_check_output(message: str):
+        """Turn a malformed user check output into a validation error."""
+        from pandera.errors import SchemaError, SchemaErrorReason
+
+        return SchemaError(
+            schema=None,
+            data=None,
+            message=message,
+            failure_cases=message,
+            check="conditional_check",
+            reason_code=SchemaErrorReason.CHECK_ERROR,
+        )
+
+    def _conditional_field(
+        self,
+        check_obj: Union[pd.Series, pd.DataFrame],
+        key: Optional[str],
+        validation_context,
+        head,
+        tail,
+        sample,
+        random_state,
+    ) -> CheckResult:
+        """Run a column-level check against the rows selected by ``where``."""
+        ctx = validation_context
+        full_table = ctx.full_table
+        positions = ctx.selection_for_check(
+            self.check, head, tail, sample, random_state
+        )
+
+        # extract the values the check function is allowed to see. For column
+        # checks the checked object is either the column Series or the full
+        # table; `key` identifies the column in the latter case.
+        if is_field(check_obj):
+            field_obj = check_obj
+        else:
+            field_obj = check_obj[key]
+
+        if len(positions) == 0:
+            # no selected rows: the check vacuously passes and the user
+            # function is never invoked. Reconstruct an all-true full-length
+            # output so downstream shape conventions are unchanged.
+            full_output = pd.Series(True, index=field_obj.index)
+            return CheckResult(
+                check_output=full_output,
+                check_passed=True,
+                checked_object=field_obj,
+                failure_cases=None,
+                row_positions=frozenset(),
+            )
+
+        selected_field = field_obj.iloc[positions]
+        selected_positions = positions
+
+        # ignore_na applies *after* the conditional selection, with its
+        # original semantics: null elements of the selected field are dropped
+        # before the check function sees them. Track which selected positions
+        # survive so failures still map to the right physical rows.
+        if self.check.ignore_na and selected_field.hasnans:
+            non_null_mask = ~selected_field.isna()
+            checked_field = selected_field.loc[non_null_mask]
+            checked_positions = selected_positions[non_null_mask.to_numpy()]
+        else:
+            checked_field = selected_field
+            checked_positions = selected_positions
+
+        if len(checked_field) == 0:
+            full_output = pd.Series(True, index=field_obj.index)
+            return CheckResult(
+                check_output=full_output,
+                check_passed=True,
+                checked_object=field_obj,
+                failure_cases=None,
+                row_positions=frozenset(),
+            )
+
+        check_output = self.apply(checked_field)
+
+        if is_bool(check_output):
+            # scalar False only means the whole check failed; individual
+            # physical rows cannot be inferred.
+            return CheckResult(
+                check_output=bool(check_output),
+                check_passed=bool(check_output),
+                checked_object=checked_field,
+                failure_cases=None,
+                row_positions=None,
+            )
+
+        check_output = self._as_bool_series(check_output)
+        if not check_output.index.equals(checked_field.index):
+            raise self._bad_check_output(
+                "Conditional column check returned a Series whose index "
+                "does not match the selected rows."
+            )
+
+        # map failures back to physical positions of the full table. Positions
+        # (not index labels) are used so duplicate labels stay distinct.
+        rel_failed = np.flatnonzero(~check_output.to_numpy())
+        failed_positions = frozenset(
+            int(p) for p in checked_positions[rel_failed]
+        )
+
+        # build a full-length boolean output (excluded rows count as passing)
+        full_output = pd.Series(True, index=field_obj.index)
+        full_output.iloc[checked_positions] = check_output.to_numpy()
+
+        failure_cases = self._conditional_field_failure_cases(
+            full_table, field_obj, failed_positions
+        )
+        return CheckResult(
+            check_output=full_output,
+            check_passed=len(failed_positions) == 0,
+            checked_object=checked_field,
+            failure_cases=failure_cases,
+            row_positions=failed_positions,
+        )
+
+    def _conditional_field_failure_cases(
+        self,
+        full_table: pd.DataFrame,
+        field_obj: pd.Series,
+        failed_positions: frozenset,
+    ) -> pd.DataFrame:
+        """Build the canonical per-row failure_cases frame for a field."""
+        if not failed_positions:
+            return pd.DataFrame(
+                columns=["index", "failure_case", "row_position"]
+            )
+        ordered = sorted(failed_positions)
+        failed_values = field_obj.iloc[ordered]
+        return pd.DataFrame(
+            {
+                "index": full_table.index[ordered],
+                "failure_case": failed_values.to_numpy(),
+                "row_position": ordered,
+            }
+        )
+
+    def _conditional_table(
+        self,
+        check_obj: pd.DataFrame,
+        key: Optional[str],
+        validation_context,
+        head,
+        tail,
+        sample,
+        random_state,
+    ) -> CheckResult:
+        """Run a table-level check against the rows selected by ``where``."""
+        ctx = validation_context
+        full_table = ctx.full_table
+        positions = ctx.selection_for_check(
+            self.check, head, tail, sample, random_state
+        )
+
+        if len(positions) == 0:
+            return CheckResult(
+                check_output=True,
+                check_passed=True,
+                checked_object=full_table.iloc[[]],
+                failure_cases=None,
+                row_positions=frozenset(),
+            )
+
+        selected_table = full_table.iloc[positions]
+
+        # ignore_na for table checks: rows containing any null in the checked
+        # table are excluded from the check function, matching the existing
+        # postprocess semantics (null rows can never fail).
+        if self.check.ignore_na and selected_table.isna().any(axis=1).any():
+            non_null = ~selected_table.isna().any(axis=1)
+            checked_table = selected_table.loc[non_null]
+        else:
+            checked_table = selected_table
+            non_null = pd.Series(True, index=selected_table.index)
+
+        if len(checked_table) == 0:
+            return CheckResult(
+                check_output=True,
+                check_passed=True,
+                checked_object=checked_table,
+                failure_cases=None,
+                row_positions=frozenset(),
+            )
+
+        check_output = self.apply(checked_table)
+
+        if is_bool(check_output):
+            return CheckResult(
+                check_output=bool(check_output),
+                check_passed=bool(check_output),
+                checked_object=checked_table,
+                failure_cases=None,
+                row_positions=None,
+            )
+
+        checked_positions = positions[non_null.to_numpy()]
+
+        if is_field(check_output):
+            check_output = self._as_bool_series(check_output)
+            if not check_output.index.equals(checked_table.index):
+                raise self._bad_check_output(
+                    "Conditional table check returned a Series whose index "
+                    "does not match the selected rows."
+                )
+            rel_failed = np.flatnonzero(~check_output.to_numpy())
+            failed_positions = frozenset(
+                int(p) for p in checked_positions[rel_failed]
+            )
+            full_output = pd.Series(True, index=full_table.index)
+            if len(checked_positions):
+                full_output.iloc[checked_positions] = check_output.to_numpy()
+            if key is not None and key in full_table.columns:
+                # column-style table check: report the checked column's
+                # failing business values.
+                failed_values = full_table[key].iloc[
+                    sorted(failed_positions)
+                ]
+            else:
+                # table-level boolean Series check: report the boolean
+                # check result at each failing row.
+                failed_values = check_output.iloc[rel_failed]
+            failure_cases = self._conditional_table_field_failure_cases(
+                full_table, key, failed_positions, failed_values
+            )
+            return CheckResult(
+                check_output=full_output,
+                check_passed=len(failed_positions) == 0,
+                checked_object=checked_table,
+                failure_cases=failure_cases,
+                row_positions=failed_positions,
+            )
+
+        if is_table(check_output):
+            if not check_output.index.equals(checked_table.index):
+                raise self._bad_check_output(
+                    "Conditional table check returned a DataFrame whose "
+                    "index does not match the selected rows."
+                )
+            bool_output = check_output.copy()
+            for col in bool_output.columns:
+                bool_output[col] = self._as_bool_series(bool_output[col])
+
+            failed_row_mask = (~bool_output).any(axis=1).to_numpy()
+            rel_failed = np.flatnonzero(failed_row_mask)
+            failed_positions = frozenset(
+                int(p) for p in checked_positions[rel_failed]
+            )
+            full_output = pd.DataFrame(
+                True, index=full_table.index, columns=check_output.columns
+            )
+            if len(checked_positions):
+                full_output.iloc[checked_positions] = bool_output
+            failure_cases = self._conditional_table_dataframe_failure_cases(
+                full_table, checked_table, bool_output, checked_positions
+            )
+            return CheckResult(
+                check_output=full_output,
+                check_passed=len(failed_positions) == 0,
+                checked_object=checked_table,
+                failure_cases=failure_cases,
+                row_positions=failed_positions,
+            )
+
+        raise NotImplementedError(
+            f"Unsupported conditional check output type {type(check_output)}"
+        )
+
+    def _conditional_table_field_failure_cases(
+        self,
+        full_table: pd.DataFrame,
+        key: Optional[str],
+        failed_positions: frozenset,
+        failed_values: Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
+        if not failed_positions:
+            return pd.DataFrame(
+                columns=["index", "failure_case", "row_position"]
+            )
+        ordered = sorted(failed_positions)
+        if failed_values is not None:
+            values = failed_values.to_numpy()
+        elif key is not None and key in full_table.columns:
+            values = full_table[key].iloc[ordered].to_numpy()
+        else:
+            values = [False] * len(ordered)
+        return pd.DataFrame(
+            {
+                "index": full_table.index[ordered],
+                "failure_case": values,
+                "row_position": ordered,
+            }
+        )
+
+    def _conditional_table_dataframe_failure_cases(
+        self,
+        full_table: pd.DataFrame,
+        checked_table: pd.DataFrame,
+        bool_output: pd.DataFrame,
+        checked_positions: np.ndarray,
+    ) -> pd.DataFrame:
+        """One diagnostic row per (physical row, column) failure."""
+        records = []
+        rel_rows, rel_cols = np.nonzero(~bool_output.to_numpy())
+        for rel_row, rel_col in zip(rel_rows, rel_cols):
+            pos = int(checked_positions[rel_row])
+            col = bool_output.columns[rel_col]
+            records.append(
+                {
+                    "index": full_table.index[pos],
+                    "failure_case": checked_table.iloc[rel_row, rel_col],
+                    "row_position": pos,
+                    "column": col,
+                }
+            )
+        if not records:
+            return pd.DataFrame(
+                columns=["index", "failure_case", "row_position", "column"]
+            )
+        return pd.DataFrame(records)
+
     def __call__(
         self,
         check_obj: Union[pd.Series, pd.DataFrame],
         key: Optional[str] = None,
+        validation_context: Optional[Any] = None,
+        head: Optional[int] = None,
+        tail: Optional[int] = None,
+        sample: Optional[int] = None,
+        random_state: Optional[int] = None,
     ) -> CheckResult:
+        if self.check.where is not None:
+            # conditional validation targets real pandas objects only;
+            # dask/modin/pyspark.pandas frames share this backend but lack
+            # the positional semantics the feature relies on.
+            module = type(check_obj).__module__
+            if not module.startswith("pandas."):
+                from pandera.errors import SchemaDefinitionError
+
+                raise SchemaDefinitionError(
+                    "The `where` argument of Check is only supported for "
+                    f"pandas DataFrames, not objects from {module!r}."
+                )
+
+        if validation_context is not None and self.check.where is not None:
+            if is_field(check_obj):
+                # SeriesSchema has no full table context and cannot support
+                # cross-row conditional callables.
+                from pandera.errors import SchemaDefinitionError
+
+                raise SchemaDefinitionError(
+                    "`where` checks are only supported for DataFrameSchema "
+                    "table-level checks and Column checks inside a "
+                    "DataFrameSchema, not for standalone SeriesSchema."
+                )
+            if key is None:
+                return self._conditional_table(
+                    check_obj,
+                    key,
+                    validation_context,
+                    head,
+                    tail,
+                    sample,
+                    random_state,
+                )
+            return self._conditional_field(
+                check_obj,
+                key,
+                validation_context,
+                head,
+                tail,
+                sample,
+                random_state,
+            )
+
         check_obj = self.preprocess(check_obj, key)
         check_output = self.apply(check_obj)
         return self.postprocess(check_obj, check_output)

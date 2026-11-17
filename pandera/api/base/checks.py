@@ -28,6 +28,10 @@ class CheckResult(NamedTuple):
     check_passed: Any
     checked_object: Any
     failure_cases: Any
+    # physical 0-based row positions (relative to the preprocessed table)
+    # attributed by a conditional (`where`) check; ``None`` for schemas
+    # without any ``where`` check.
+    row_positions: Optional["frozenset[int]"] = None
 
 
 _T = TypeVar("_T", bound="BaseCheck")

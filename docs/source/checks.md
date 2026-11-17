@@ -241,6 +241,109 @@ key-word argument, the check function should expect a pandas `DataFrame` and
 should return a `bool`, a `Series` of booleans, or a `DataFrame` of
 boolean values.
 
+(conditional-checks)=
+
+## Conditional Checks with `where`
+
+*New in version 0.24.0*
+
+Quality rules frequently apply to only part of a batch: for example, "the
+amount must be positive **for settled records only**", while unsettled
+records are exempt for now. Instead of filtering the table before validating
+and stitching the excluded rows back afterwards, pass the keyword-only
+`where` argument to a `Check`:
+
+```{code-cell} python
+import pandas as pd
+import pandera.pandas as pa
+
+df = pd.DataFrame({
+    "settled": [True, False, True, False, True],
+    "amount": [10.0, -5.0, -20.0, -1.0, 30.0],
+}, index=["a", "b", "c", "d", "e"])
+
+schema = pa.DataFrameSchema({
+    "amount": pa.Column(float, pa.Check(
+        lambda s: s > 0,
+        name="positive_when_settled",
+        where=lambda table: table["settled"],
+    )),
+    "settled": pa.Column(bool),
+})
+```
+
+The `where` callable:
+
+- receives the **full, preprocessed** `DataFrame` (schema-level parsers,
+  default values and dtype coercion have already run), so column-level
+  checks can read other columns;
+- must return a boolean, or pandas nullable boolean, `Series` with the same
+  length and index as the table. The mask is interpreted **positionally**,
+  and `NA` in a nullable boolean series means "not selected";
+- is evaluated at most once per `validate()` call and is never forwarded to
+  the check function as a keyword argument;
+- sees a defensive copy of the table, so mutating the argument cannot affect
+  the validation.
+
+Only the selected rows reach the check function; the other rows cannot fail.
+When no row is selected the check passes and the check function is not
+called. `ignore_na` keeps its usual meaning and is applied to the selected
+rows afterwards. Both column-level and table-level checks work, in vectorized
+and element-wise form.
+
+### Physical row positions and `row_position`
+
+As soon as a schema contains at least one `where` check, pandera tracks
+failures by **physical row position**: a 0-based offset into the
+preprocessed table, independent of the index labels. The `index` column of
+`SchemaErrors.failure_cases` still shows the original labels, while the new
+`row_position` column shows the offset. Repeated labels, `MultiIndex`
+duplicates and even fully identical rows therefore stay distinct records:
+
+```{code-cell} python
+try:
+    schema.validate(df, lazy=True)
+except pa.errors.SchemaErrors as err:
+    print(err.failure_cases[["check", "failure_case", "index", "row_position"]])
+```
+
+Schemas without any `where` check keep their previous public behavior and do
+not gain the `row_position` column.
+
+### Sampling intersects the condition
+
+`head`, `tail` and `sample` (with `random_state`) keep their original
+meaning, but the sampling window is computed on the **full table** and then
+intersected positionally with the `where` mask. Overlapping windows are
+de-duplicated by physical position, so a row drawn by more than one window
+is checked at most once; rows outside the window are simply not checked and
+remain in the returned table.
+
+### Diagnostics vs. the full failure set
+
+`n_failure_cases` only limits how many failure cases are *displayed*. With
+`drop_invalid_rows=True` every physical row the check actually failed is
+still removed, even when `n_failure_cases=1`. Warning checks never remove
+rows, and a row that fails several checks (or several cells of a wide check)
+is removed at most once; surviving rows keep their original order, index and
+values.
+
+Some failures cannot be attributed to concrete physical rows — a check
+returning scalar `False`, an exception raised inside `where` or the check
+function, or a missing required column. In drop mode pandera then raises
+`SchemaErrors` rather than guessing which rows to remove.
+
+### Limits
+
+- `where` is supported for pandas `DataFrameSchema` table-level checks and
+  `Column` checks. Standalone `SeriesSchema` checks and the polars/pyspark
+  backends raise a `SchemaDefinitionError`.
+- `where` and `groupby` cannot be combined; a `SchemaDefinitionError` is
+  raised at construction time.
+- Column parsers may change values but, while a `where` check is present,
+  must not change the row count or index sequence; row filtering belongs in
+  a schema-level parser, whose resulting table defines the row positions.
+
 ## Raise Warning Instead of Error on Check Failure
 
 In some cases, you might want to raise a warning and continue execution

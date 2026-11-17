@@ -126,6 +126,7 @@ class ComponentSchema(Generic[TDataObject], BaseSchema):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context: Optional[Any] = None,
     ):
         # pylint: disable=too-many-locals,too-many-branches,too-many-statements
         """Validate a series or specific column in dataframe.
@@ -143,6 +144,8 @@ class ComponentSchema(Generic[TDataObject], BaseSchema):
             ``SchemaError`` as soon as one occurs.
         :param inplace: if True, applies coercion to the object of validation,
             otherwise creates a copy of the data.
+        :param validation_context: per-validation bookkeeping object for
+            conditional (``where``) checks.
         :returns: validated DataFrame or Series.
 
         """
@@ -155,6 +158,7 @@ class ComponentSchema(Generic[TDataObject], BaseSchema):
             random_state=random_state,
             lazy=lazy,
             inplace=inplace,
+            validation_context=validation_context,
         )
 
     def __call__(

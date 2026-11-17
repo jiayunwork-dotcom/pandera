@@ -25,6 +25,17 @@ as well as `DataFrameModel` schemas.
 **Note** that this functionality works by identifying the index or multi-index of the failing rows.
 If the index is not unique on the dataframe, this could result in incorrect rows being dropped.
 
+```{note}
+When at least one check uses the conditional `where` argument (see
+{ref}`conditional-checks`), invalid rows are instead identified by their
+physical row position (a 0-based offset into the preprocessed table), so
+duplicated index labels, duplicated `MultiIndex` tuples and identical rows
+are handled correctly: only the physical rows that a check actually failed
+are removed. Errors that cannot be attributed to concrete rows (scalar
+`False` check results, `where`/check exceptions, missing columns) still
+raise `SchemaErrors` instead of dropping a guessed set of rows.
+```
+
 Dropping invalid rows with {class}`~pandera.api.pandas.container.DataFrameSchema`:
 
 ```{code-cell} python

@@ -105,6 +105,8 @@ class SchemaError(ReducedPickleExceptionBase):
         parser_output=None,
         reason_code=None,
         column_name=None,
+        row_positions=None,
+        original_exc=None,
     ):
         super().__init__(message)
         self.schema = schema
@@ -118,6 +120,12 @@ class SchemaError(ReducedPickleExceptionBase):
         self.parser_output = parser_output
         self.reason_code = reason_code
         self.column_name = column_name
+        # Physical row positions (0-based, relative to the preprocessed
+        # table) that the failing check attributed. Only populated when at
+        # least one `where` check is present in the schema; ``None`` means
+        # the error cannot be attributed to concrete physical rows.
+        self.row_positions = row_positions
+        self.original_exc = original_exc
 
 
 class SchemaWarning(UserWarning):

@@ -4,6 +4,7 @@ import warnings
 from collections import defaultdict
 from typing import List, Optional, TypeVar, Union
 
+import numpy as np
 import pandas as pd
 
 from pandera.api.base.checks import CheckResult
@@ -101,6 +102,11 @@ class PandasSchemaBackend(BaseSchemaBackend):
         check,
         check_index: int,
         *args,
+        validation_context=None,
+        head=None,
+        tail=None,
+        sample=None,
+        random_state=None,
     ) -> CoreCheckResult:
         """Handle check results, raising SchemaError on check failure.
 
@@ -112,7 +118,15 @@ class PandasSchemaBackend(BaseSchemaBackend):
         :returns: True if check results pass or check.raise_warning=True, otherwise
             False.
         """
-        check_result: CheckResult = check(check_obj, *args)
+        check_result: CheckResult = check(
+            check_obj,
+            *args,
+            validation_context=validation_context,
+            head=head,
+            tail=tail,
+            sample=sample,
+            random_state=random_state,
+        )
 
         passed = check_result.check_passed
         failure_cases = None
@@ -129,6 +143,22 @@ class PandasSchemaBackend(BaseSchemaBackend):
                 failure_cases = reshape_failure_cases(
                     check_result.failure_cases, check.ignore_na
                 )
+                # In conditional mode the check backend already computed the
+                # *complete* set of failing physical rows (needed for
+                # drop_invalid_rows); n_failure_cases only limits how many
+                # diagnostics are displayed. Truncate the diagnostic frame
+                # here, after row positions have been recorded, so dropping
+                # is unaffected. Truncation is by distinct physical row,
+                # matching the existing "unique failure cases" semantics.
+                if (
+                    validation_context is not None
+                    and check.n_failure_cases is not None
+                    and hasattr(failure_cases, "drop_duplicates")
+                    and "row_position" in failure_cases.columns
+                ):
+                    failure_cases = failure_cases.drop_duplicates(
+                        subset=["row_position"]
+                    ).head(check.n_failure_cases)
                 message = format_vectorized_error_message(
                     schema, check, check_index, failure_cases
                 )
@@ -144,6 +174,7 @@ class PandasSchemaBackend(BaseSchemaBackend):
                     passed=True,
                     check=check,
                     reason_code=SchemaErrorReason.DATAFRAME_CHECK,
+                    row_positions=check_result.row_positions,
                 )
 
         return CoreCheckResult(
@@ -154,6 +185,7 @@ class PandasSchemaBackend(BaseSchemaBackend):
             reason_code=SchemaErrorReason.DATAFRAME_CHECK,
             message=message,
             failure_cases=failure_cases,
+            row_positions=check_result.row_positions,
         )
 
     def failure_cases_metadata(
@@ -189,6 +221,11 @@ class PandasSchemaBackend(BaseSchemaBackend):
 
     def drop_invalid_rows(self, check_obj, error_handler: ErrorHandler):
         """Remove invalid elements in a check obj according to failures caught by the error handler."""
+        if getattr(error_handler, "validation_context", None) is not None:
+            return self._drop_invalid_rows_by_position(
+                check_obj, error_handler
+            )
+
         for err in error_handler.schema_errors:
             if isinstance(err.failure_cases, str):
                 # if the failure cases are a string, it means the error is
@@ -204,3 +241,28 @@ class PandasSchemaBackend(BaseSchemaBackend):
             check_obj = check_obj.loc[mask]
 
         return check_obj
+
+    def _drop_invalid_rows_by_position(
+        self, check_obj, error_handler: ErrorHandler
+    ):
+        """Drop rows using physical row positions (conditional validation).
+
+        Positions are 0-based offsets into the preprocessed table. They are
+        exact even when index labels repeat, and the union across checks is
+        de-duplicated so a row failing several checks is removed at most
+        once. Any error without reliable row positions makes positional
+        dropping impossible: the caller is expected to have converted that
+        situation into a raised ``SchemaErrors`` before reaching here.
+        """
+        ctx = error_handler.validation_context
+        if ctx.has_unlocatable_error:
+            raise RuntimeError(
+                "drop_invalid_rows cannot proceed: at least one validation "
+                "error could not be attributed to concrete physical rows."
+            )
+        positions = sorted(ctx.dropped_positions)
+        if not positions:
+            return check_obj
+        keep = np.ones(len(check_obj), dtype=bool)
+        keep[positions] = False
+        return check_obj.iloc[keep]

@@ -24,6 +24,9 @@ class CoreCheckResult(NamedTuple):
     failure_cases: Optional[Any] = None
     schema_error: Optional[SchemaError] = None
     original_exc: Optional[Exception] = None
+    # physical 0-based row positions in the preprocessed table that failed;
+    # only populated when the schema contains conditional (`where`) checks.
+    row_positions: Optional["frozenset[int]"] = None
 
 
 class ColumnInfo(NamedTuple):

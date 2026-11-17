@@ -5,7 +5,7 @@ from typing import List, Optional, cast
 import pandas as pd
 
 from pandera.api.base.error_handler import ErrorHandler
-from pandera.api.pandas.types import is_field
+from pandera.api.pandas.types import is_field, is_table
 from pandera.backends.base import CoreCheckResult, CoreParserResult
 from pandera.backends.pandas.base import PandasSchemaBackend
 from pandera.backends.pandas.error_formatters import reshape_failure_cases
@@ -39,10 +39,21 @@ class ArraySchemaBackend(PandasSchemaBackend):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context=None,
     ):
         # pylint: disable=too-many-locals
-        error_handler = ErrorHandler(lazy)
+        error_handler = ErrorHandler(lazy, validation_context=validation_context)
         check_obj = self.preprocess(check_obj, inplace)
+
+        if is_field(check_obj):
+            for check in getattr(schema, "checks", []) or []:
+                if getattr(check, "where", None) is not None:
+                    raise SchemaDefinitionError(
+                        "`where` checks are only supported for "
+                        "DataFrameSchema table-level checks and Column "
+                        "checks inside a DataFrameSchema, not for "
+                        "standalone SeriesSchema."
+                    )
 
         if getattr(schema, "drop_invalid_rows", False) and not lazy:
             raise SchemaDefinitionError(
@@ -54,7 +65,9 @@ class ArraySchemaBackend(PandasSchemaBackend):
             check_obj = self.set_default(check_obj, schema)
 
         # run custom parsers
-        check_obj = self.run_parsers(schema, check_obj)
+        check_obj = self.run_parsers(
+            schema, check_obj, validation_context=validation_context
+        )
 
         try:
             if is_field(check_obj) and schema.coerce:
@@ -79,10 +92,19 @@ class ArraySchemaBackend(PandasSchemaBackend):
             tail=tail,
             sample=sample,
             random_state=random_state,
+            validation_context=validation_context,
         )
 
         if lazy and error_handler.collected_errors:
             if getattr(schema, "drop_invalid_rows", False):
+                if validation_context is not None and (
+                    validation_context.has_unlocatable_error
+                ):
+                    raise SchemaErrors(
+                        schema=schema,
+                        schema_errors=error_handler.schema_errors,
+                        data=check_obj,
+                    )
                 check_obj = self.drop_invalid_rows(check_obj, error_handler)
             else:
                 raise SchemaErrors(
@@ -94,27 +116,57 @@ class ArraySchemaBackend(PandasSchemaBackend):
         return check_obj
 
     def run_checks_and_handle_errors(
-        self, error_handler, schema, check_obj, **subsample_kwargs
+        self,
+        error_handler,
+        schema,
+        check_obj,
+        validation_context=None,
+        **subsample_kwargs,
     ):
         """Run checks on schema"""
         # pylint: disable=too-many-locals
-        field_obj_subsample = self.subsample(
-            check_obj if is_field(check_obj) else check_obj[schema.name],
-            **subsample_kwargs,
-        )
+        head = subsample_kwargs.get("head")
+        tail = subsample_kwargs.get("tail")
+        sample = subsample_kwargs.get("sample")
+        random_state = subsample_kwargs.get("random_state")
 
-        check_obj_subsample = self.subsample(check_obj, **subsample_kwargs)
+        # In conditional mode individual checks own their sampling: they
+        # intersect the full-table sample window with their `where` mask.
+        # Subsampling here would clip the rows before the mask is evaluated.
+        if validation_context is None:
+            field_obj_subsample = self.subsample(
+                check_obj if is_field(check_obj) else check_obj[schema.name],
+                **subsample_kwargs,
+            )
+            check_obj_subsample = self.subsample(check_obj, **subsample_kwargs)
+        else:
+            field_obj_subsample = (
+                check_obj if is_field(check_obj) else check_obj[schema.name]
+            )
+            check_obj_subsample = check_obj
 
         core_checks = [
-            (self.check_name, (field_obj_subsample, schema)),
-            (self.check_nullable, (field_obj_subsample, schema)),
-            (self.check_unique, (field_obj_subsample, schema)),
-            (self.check_dtype, (field_obj_subsample, schema)),
-            (self.run_checks, (check_obj_subsample, schema)),
+            (self.check_name, (field_obj_subsample, schema), {}),
+            (self.check_nullable, (field_obj_subsample, schema), {}),
+            (self.check_unique, (field_obj_subsample, schema), {}),
+            (self.check_dtype, (field_obj_subsample, schema), {}),
+            (
+                self.run_checks,
+                (),
+                dict(
+                    check_obj=check_obj_subsample,
+                    schema=schema,
+                    validation_context=validation_context,
+                    head=head,
+                    tail=tail,
+                    sample=sample,
+                    random_state=random_state,
+                ),
+            ),
         ]
 
-        for core_check, args in core_checks:
-            results = core_check(*args)
+        for core_check, args, kwargs in core_checks:
+            results = core_check(*args, **kwargs)
             if isinstance(results, CoreCheckResult):
                 results = [results]
             results = cast(List[CoreCheckResult], results)
@@ -134,6 +186,8 @@ class ArraySchemaBackend(PandasSchemaBackend):
                         check_index=result.check_index,
                         check_output=result.check_output,
                         reason_code=result.reason_code,
+                        row_positions=result.row_positions,
+                        original_exc=result.original_exc,
                     )
                     error_handler.collect_error(
                         validation_type(result.reason_code),
@@ -175,10 +229,13 @@ class ArraySchemaBackend(PandasSchemaBackend):
                 reason_code=SchemaErrorReason.DATATYPE_COERCION,
             ) from exc
 
-    def run_parsers(self, schema, check_obj):
+    def run_parsers(
+        self, schema, check_obj, validation_context=None
+    ):
         parser_results: List[CoreParserResult] = []
         for parser_index, parser in enumerate(schema.parsers):
             parser_args = [None] if is_field(check_obj) else [schema.name]
+            before = check_obj
             result = self.run_parser(
                 check_obj,
                 parser,
@@ -187,6 +244,12 @@ class ArraySchemaBackend(PandasSchemaBackend):
             )
             check_obj = result.parser_output
             parser_results.append(result)
+            if validation_context is not None and is_table(before):
+                validation_context.assert_parser_preserves_rows(
+                    before,
+                    check_obj,
+                    getattr(parser, "name", f"parser_{parser_index}"),
+                )
         return check_obj
 
     @validate_scope(scope=ValidationScope.SCHEMA)
@@ -315,7 +378,16 @@ class ArraySchemaBackend(PandasSchemaBackend):
         )
 
     @validate_scope(scope=ValidationScope.DATA)
-    def run_checks(self, check_obj, schema) -> List[CoreCheckResult]:
+    def run_checks(
+        self,
+        check_obj,
+        schema,
+        validation_context=None,
+        head=None,
+        tail=None,
+        sample=None,
+        random_state=None,
+    ) -> List[CoreCheckResult]:
         check_results: List[CoreCheckResult] = []
         for check_index, check in enumerate(schema.checks):
             check_args = [None] if is_field(check_obj) else [schema.name]
@@ -327,6 +399,11 @@ class ArraySchemaBackend(PandasSchemaBackend):
                         check,
                         check_index,
                         *check_args,
+                        validation_context=validation_context,
+                        head=head,
+                        tail=tail,
+                        sample=sample,
+                        random_state=random_state,
                     )
                 )
             except Exception as err:  # pylint: disable=broad-except

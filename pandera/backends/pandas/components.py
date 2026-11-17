@@ -2,6 +2,7 @@
 
 # pylint: disable=too-many-locals
 
+import copy as copy_module
 import traceback
 from copy import deepcopy
 from typing import Iterable, List, Optional, Union
@@ -42,13 +43,16 @@ class ColumnBackend(ArraySchemaBackend):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context=None,
     ) -> pd.DataFrame:
         # pylint: disable=too-many-branches
         """Validation backend implementation for pandas dataframe columns.."""
         if not inplace:
             check_obj = check_obj.copy()
 
-        error_handler = ErrorHandler(lazy=lazy)
+        error_handler = ErrorHandler(
+            lazy=lazy, validation_context=validation_context
+        )
 
         if getattr(schema, "drop_invalid_rows", False) and not lazy:
             raise SchemaDefinitionError(
@@ -80,6 +84,7 @@ class ColumnBackend(ArraySchemaBackend):
                     random_state=random_state,
                     lazy=lazy,
                     inplace=inplace,
+                    validation_context=validation_context,
                 )
                 # revert the schema component mutations
                 schema.name = _orig_name
@@ -129,19 +134,59 @@ class ColumnBackend(ArraySchemaBackend):
                     if schema.parsers:
                         check_obj[column_name] = validated_column
             else:
-                if getattr(schema, "drop_invalid_rows", False):
-                    # replace the check_obj with the validated
+                if (
+                    getattr(schema, "drop_invalid_rows", False)
+                    and validation_context is None
+                ):
+                    # replace the check_obj with the validated. In
+                    # conditional mode rows are dropped once, at the end of
+                    # the whole schema validation, using physical positions;
+                    # the column backend only accumulates failure positions.
                     check_obj = validate_column(
                         check_obj, column_name, return_check_obj=True
                     )
+                    validated_column = check_obj
+                elif schema.parsers and validation_context is not None:
+                    # Column parsers return the parsed Series (or column),
+                    # but conditional checks must keep seeing the full table
+                    # since the `where` callable may read other columns.
+                    # Run the parsers directly (once), verify they preserved
+                    # the row sequence, write the parsed column back, then run
+                    # the check pass once against the reassembled table using
+                    # a parser-free copy so parsers are not re-executed.
+                    parsed = self._run_column_parsers(
+                        check_obj, schema, column_name, validation_context
+                    )
+                    if isinstance(parsed, pd.Series):
+                        check_obj[column_name] = parsed
+                    elif is_table(parsed) and column_name in parsed.columns:
+                        check_obj[column_name] = parsed[column_name]
+                    else:
+                        check_obj = parsed
+                    check_only = self._check_only_component(schema)
+                    validated_column = check_only.get_backend(check_obj).validate(
+                        check_obj,
+                        schema=check_only.set_name(column_name),
+                        head=head,
+                        tail=tail,
+                        sample=sample,
+                        random_state=random_state,
+                        lazy=lazy,
+                        inplace=True,
+                        validation_context=validation_context,
+                    )
+                else:
+                    validated_column = validate_column(
+                        check_obj,
+                        column_name,
+                        return_check_obj=True,
+                    )
 
-                validated_column = validate_column(
-                    check_obj,
-                    column_name,
-                    return_check_obj=True,
-                )
                 if schema.parsers:
-                    check_obj[column_name] = validated_column
+                    if isinstance(validated_column, pd.Series):
+                        check_obj[column_name] = validated_column
+                    elif is_table(validated_column):
+                        check_obj[column_name] = validated_column[column_name]
 
         if lazy and error_handler.collected_errors:
             raise SchemaErrors(
@@ -151,6 +196,64 @@ class ColumnBackend(ArraySchemaBackend):
             )
 
         return check_obj
+
+    @staticmethod
+    def _check_only_component(schema):
+        """Shallow-copy a column schema keeping only its checks."""
+        check_only = copy_module.copy(schema)
+        check_only.parsers = []
+        check_only.checks = list(schema.checks)
+        return check_only
+
+    def _run_column_parsers(
+        self, check_obj, schema, column_name, validation_context
+    ):
+        """Execute a column's parsers without running its checks.
+
+        Returns the parsed column (Series) or parsed table, asserting that
+        every parser preserved the physical row sequence required for
+        conditional validation.
+        """
+        parsed_obj = check_obj
+        for parser_index, parser in enumerate(schema.parsers):
+            before = parsed_obj
+            result = self.run_parser(
+                parsed_obj,
+                parser,
+                parser_index,
+                column_name,
+            )
+            parsed_obj = result.parser_output
+
+            # compare row count and index sequence at the table level when
+            # possible; a parser that returns a column Series must match the
+            # rows of the table it was derived from.
+            if is_table(parsed_obj):
+                reference_before = before if is_table(before) else check_obj
+                validation_context.assert_parser_preserves_rows(
+                    reference_before,
+                    parsed_obj,
+                    getattr(parser, "name", f"parser_{parser_index}"),
+                )
+            elif isinstance(parsed_obj, pd.Series):
+                reference_index = (
+                    before.index
+                    if is_table(before)
+                    else check_obj.index
+                )
+                if len(parsed_obj) != len(reference_index) or not parsed_obj.index.equals(
+                    reference_index
+                ):
+                    from pandera.errors import SchemaDefinitionError
+
+                    raise SchemaDefinitionError(
+                        f"Column parser {parser_index!r} changed the number "
+                        "of rows or the index sequence while conditional "
+                        "(`where`) checks are enabled. Conditional validation "
+                        "requires column parsers to preserve row count and "
+                        "index order."
+                    )
+        return parsed_obj
 
     def get_regex_columns(self, schema, check_obj) -> Iterable:
         """Get matching column names based on regex column name pattern.
@@ -228,14 +331,32 @@ class ColumnBackend(ArraySchemaBackend):
             axis="columns",
         )
 
-    def run_checks(self, check_obj, schema):
+    def run_checks(
+        self,
+        check_obj,
+        schema,
+        validation_context=None,
+        head=None,
+        tail=None,
+        sample=None,
+        random_state=None,
+    ):
         check_results: List[CoreCheckResult] = []
         for check_index, check in enumerate(schema.checks):
             check_args = [None] if is_field(check_obj) else [schema.name]
             try:
                 check_results.append(
                     self.run_check(
-                        check_obj, schema, check, check_index, *check_args
+                        check_obj,
+                        schema,
+                        check,
+                        check_index,
+                        *check_args,
+                        validation_context=validation_context,
+                        head=head,
+                        tail=tail,
+                        sample=sample,
+                        random_state=random_state,
                     )
                 )
             except SchemaError as err:
@@ -244,10 +365,12 @@ class ColumnBackend(ArraySchemaBackend):
                         passed=False,
                         check=check,
                         check_index=check_index,
-                        reason_code=SchemaErrorReason.DATAFRAME_CHECK,
+                        reason_code=err.reason_code
+                        or SchemaErrorReason.DATAFRAME_CHECK,
                         message=str(err),
                         failure_cases=err.failure_cases,
-                        original_exc=err,
+                        original_exc=getattr(err, "original_exc", None) or err,
+                        row_positions=getattr(err, "row_positions", None),
                     )
                 )
             except Exception as err:  # pylint: disable=broad-except
@@ -286,6 +409,7 @@ class IndexBackend(ArraySchemaBackend):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context=None,
     ) -> Union[pd.DataFrame, pd.Series]:
         if is_multiindex(check_obj.index):
             raise SchemaError(
@@ -295,7 +419,9 @@ class IndexBackend(ArraySchemaBackend):
                 reason_code=SchemaErrorReason.MISMATCH_INDEX,
             )
 
-        error_handler = ErrorHandler(lazy)
+        error_handler = ErrorHandler(
+            lazy, validation_context=validation_context
+        )
 
         if schema.coerce:
             try:
@@ -436,6 +562,7 @@ class MultiIndexBackend(DataFrameSchemaBackend):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context=None,
     ) -> Union[pd.DataFrame, pd.Series]:
         """Validate DataFrame or Series MultiIndex.
 

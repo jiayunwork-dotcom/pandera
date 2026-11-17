@@ -91,6 +91,16 @@ def reshape_failure_cases(
             f"{type(failure_cases)}"
         )
 
+    # Conditional (`where`) checks emit canonical frames that already carry
+    # physical row positions. Pass them through untouched (except for the
+    # existing ignore_na filtering) so positions survive error reporting.
+    if is_table(failure_cases) and "row_position" in failure_cases.columns:
+        if ignore_na:
+            return failure_cases[
+                failure_cases["failure_case"].notna()
+            ].reset_index(drop=True)
+        return failure_cases.reset_index(drop=True)
+
     if (
         is_table(failure_cases)
         and "column" in failure_cases.columns
@@ -170,6 +180,21 @@ def consolidate_failure_cases(schema_errors: List[SchemaError]):
         "index",
     ]
 
+    # physical row positions are part of the public failure_cases frame as
+    # soon as the validated schema ran in conditional mode -- even when
+    # every collected error happens to be unlocatable (e.g. scalar False or
+    # a missing column). Ordinary schemas never gain the column.
+    has_row_positions = any(
+        getattr(err, "conditional_validation", False)
+        for err in schema_errors
+    ) or any(
+        is_table(err.failure_cases)
+        and "row_position" in err.failure_cases.columns
+        for err in schema_errors
+    )
+    if has_row_positions:
+        column_order.append("row_position")
+
     for err in schema_errors:
         check_identifier = (
             None
@@ -214,22 +239,40 @@ def consolidate_failure_cases(schema_errors: List[SchemaError]):
                 ),
                 **err_metadata,
             )
-            check_failure_cases.append(failure_cases[column_order])
+            if has_row_positions and "row_position" not in failure_cases.columns:
+                # locatable failures from a non-conditional check do not carry
+                # positions themselves; leave the column missing rather than
+                # inventing positions.
+                ordered = [c for c in column_order if c != "row_position"]
+                check_failure_cases.append(failure_cases[ordered])
+            else:
+                check_failure_cases.append(failure_cases[column_order])
         else:
             # assume that err.failure_cases is a scalar value
-            scalar_check_failure_cases.append(
-                {
-                    "column": err.schema.name,
-                    "failure_case": err.failure_cases,
-                    "index": None,
-                    **err_metadata,
-                }
-            )
+            scalar_record = {
+                "column": err.schema.name,
+                "failure_case": err.failure_cases,
+                "index": None,
+                **err_metadata,
+            }
+            if has_row_positions:
+                # scalar failures (e.g. a check returning scalar False) have
+                # no attributable physical rows.
+                scalar_record["row_position"] = pd.NA
+            scalar_check_failure_cases.append(scalar_record)
 
     if scalar_check_failure_cases:
         check_failure_cases.append(
             pd.DataFrame.from_records(scalar_check_failure_cases)
         )
+
+    if has_row_positions:
+        # align every fragment to the same columns so concatenation works even
+        # when some errors carry no physical row positions.
+        check_failure_cases = [
+            fragment.reindex(columns=column_order)
+            for fragment in check_failure_cases
+        ]
 
     # NOTE: this is a hack to support pyspark.pandas and modin
     concat_fn = pd.concat  # type: ignore

@@ -1,7 +1,7 @@
 """Core pandas dataframe container specification."""
 
 import warnings
-from typing import Optional, Type
+from typing import Any, Optional, Type
 
 import pandas as pd
 
@@ -39,6 +39,7 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context: Optional[Any] = None,
     ) -> pd.DataFrame:
         """Validate a DataFrame based on the schema specification.
 
@@ -131,6 +132,7 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
             random_state=random_state,
             lazy=lazy,
             inplace=inplace,
+            validation_context=validation_context,
         )
 
     def _validate(
@@ -142,6 +144,7 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context: Optional[Any] = None,
     ) -> pd.DataFrame:
 
         return self.get_backend(check_obj).validate(
@@ -153,6 +156,7 @@ class DataFrameSchema(_DataFrameSchema[pd.DataFrame]):
             random_state=random_state,
             lazy=lazy,
             inplace=inplace,
+            validation_context=validation_context,
         )
 
     @staticmethod

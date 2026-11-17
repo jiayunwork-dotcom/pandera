@@ -21,16 +21,21 @@ class ErrorCategory(Enum):
 class ErrorHandler:
     """Handler for Schema & Data level errors during validation."""
 
-    def __init__(self, lazy: bool = True) -> None:
+    def __init__(
+        self, lazy: bool = True, validation_context: Any = None
+    ) -> None:
         """Initialize ErrorHandler.
 
         :param lazy: if True, lazily evaluates all checks before raising the exception.
         Defaults to True.
+        :param validation_context: per-validation bookkeeping object for
+            conditional (``where``) schemas; ``None`` for ordinary schemas.
         """
         self._lazy = lazy
         self._collected_errors: List[Dict[str, Any]] = []
         self._schema_errors: List[SchemaError] = []
         self._summarized_errors = defaultdict(lambda: defaultdict(list))  # type: ignore
+        self.validation_context = validation_context
 
     @property
     def lazy(self) -> bool:
@@ -60,6 +65,19 @@ class ErrorHandler:
             del schema_error.data
 
         schema_error.data = None
+
+        # conditional validation: accumulate the exact physical rows each
+        # error attributes, and flag errors that cannot be located so the
+        # drop step knows not to guess. The marker also lets the error
+        # formatter add the row_position column even when no individual
+        # error is locatable (e.g. a missing column).
+        if self.validation_context is not None:
+            schema_error.conditional_validation = True
+            row_positions = getattr(schema_error, "row_positions", None)
+            if row_positions:
+                self.validation_context.add_failure_positions(row_positions)
+            else:
+                self.validation_context.mark_unlocatable_error()
 
         self._schema_errors.append(schema_error)
 

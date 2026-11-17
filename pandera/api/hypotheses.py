@@ -34,6 +34,8 @@ class Hypothesis(Check):
         description: Optional[str] = None,
         statistics: Optional[Dict[str, Any]] = None,
         strategy: Optional[Any] = None,
+        *,
+        where: Optional[Callable] = None,
         **check_kwargs,
     ) -> None:
         """Perform a hypothesis test on a Series or DataFrame.
@@ -175,6 +177,7 @@ class Hypothesis(Check):
             description=description,
             statistics=statistics,
             strategy=strategy,
+            where=where,
             **check_kwargs,
         )
 

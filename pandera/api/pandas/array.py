@@ -179,6 +179,7 @@ class SeriesSchema(ArraySchema[pd.Series]):
         random_state: Optional[int] = None,
         lazy: bool = False,
         inplace: bool = False,
+        validation_context: Optional[Any] = None,
     ) -> pd.Series:
         """Validate a Series object.
 
@@ -259,6 +260,7 @@ class SeriesSchema(ArraySchema[pd.Series]):
             random_state=random_state,
             lazy=lazy,
             inplace=inplace,
+            validation_context=validation_context,
         )
         if self.index is not None:
             validated_obj = self.index.validate(
