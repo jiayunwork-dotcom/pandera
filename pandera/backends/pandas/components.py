@@ -104,6 +104,12 @@ class ColumnBackend(ArraySchemaBackend):
                     validation_type(err.reason_code), err.reason_code, err
                 )
 
+            # Validation reported errors (e.g. a batch-level distribution
+            # outcome) instead of returning: hand back the input unchanged so
+            # callers do not receive ``None``.
+            if return_check_obj:
+                return check_obj
+
         column_keys_to_check = (
             self.get_regex_columns(schema, check_obj)
             if schema.regex
@@ -164,7 +170,9 @@ class ColumnBackend(ArraySchemaBackend):
                     else:
                         check_obj = parsed
                     check_only = self._check_only_component(schema)
-                    validated_column = check_only.get_backend(check_obj).validate(
+                    validated_column = check_only.get_backend(
+                        check_obj
+                    ).validate(
                         check_obj,
                         schema=check_only.set_name(column_name),
                         head=head,
@@ -237,13 +245,11 @@ class ColumnBackend(ArraySchemaBackend):
                 )
             elif isinstance(parsed_obj, pd.Series):
                 reference_index = (
-                    before.index
-                    if is_table(before)
-                    else check_obj.index
+                    before.index if is_table(before) else check_obj.index
                 )
-                if len(parsed_obj) != len(reference_index) or not parsed_obj.index.equals(
+                if len(parsed_obj) != len(
                     reference_index
-                ):
+                ) or not parsed_obj.index.equals(reference_index):
                     from pandera.errors import SchemaDefinitionError
 
                     raise SchemaDefinitionError(
@@ -359,6 +365,8 @@ class ColumnBackend(ArraySchemaBackend):
                         random_state=random_state,
                     )
                 )
+            except SchemaDefinitionError:
+                raise
             except SchemaError as err:
                 check_results.append(
                     CoreCheckResult(

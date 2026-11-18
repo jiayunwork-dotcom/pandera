@@ -116,3 +116,113 @@ print(json_schema)
 You can edit this json file to update the schema as needed, and then load
 it back into a pandera schema object with {func}`~pandera.io.from_json` or
 {func}`~pandera.api.pandas.container.DataFrameSchema.from_json`.
+
+(distribution-profiles)=
+
+## Distribution profiles
+
+The min/max bounds that `infer_schema` infers for numeric columns are cheap to
+store but blind to everything between the extremes: a column whose minimum and
+maximum are unchanged can still have drifted substantially. When you want to
+detect that kind of drift without keeping full reference data around, use a
+{class}`~pandera.numeric_profile.NumericProfile`.
+
+A profile summarises a stream of numeric observations with a **deterministic**
+error bound on the empirical CDF. It retains only a compact sketch (never the
+observations), and it can be serialised alongside the rest of a schema.
+
+### Build a profile from reference batches
+
+The reference data may arrive in several batches. `from_batches` traverses the
+source exactly once and only accepts `int64`, `float64` and pandas' nullable
+`Int64`/`Float64` dtypes. Missing values are ignored; all other values must be
+finite.
+
+```{code-cell} python
+import numpy as np
+import pandas as pd
+import pandera.pandas as pa
+
+reference_batches = [
+    pd.Series(np.arange(0, 50_000, dtype="float64")),
+    pd.Series(np.arange(50_000, 100_000, dtype="float64")),
+]
+profile = pa.NumericProfile.from_batches(reference_batches, epsilon=0.01)
+print(profile)
+print("F(50_000) is in", profile.cdf_bounds(50_000))
+```
+
+For any finite threshold `t`, `cdf_bounds(t)` returns `[L, U]` with
+`0 <= L <= F(t) <= U <= 1` and `U - L <= 2 * epsilon`, where `F` is the
+empirical CDF of the observations actually fed to `from_batches`. These are
+deterministic guarantees about the real input, not random confidence
+intervals. Different batch layouts or row orders may produce different
+summaries, but they all satisfy the same guarantee.
+
+### Compare a follow-up batch
+
+`compare` scores a complete follow-up batch. The true distance `D` is the
+maximum absolute difference between the two empirical CDFs; the returned
+mapping contains `distance_lower`, `distance_upper` and a `status`:
+
+```{code-cell} python
+follow_up = pd.Series(np.arange(0, 100_000, dtype="float64"))
+result = profile.compare(follow_up, tolerance=0.02)
+print(result)
+```
+
+* `pass` when `distance_upper <= tolerance`,
+* `fail` when `distance_lower > tolerance`,
+* `uncertain` otherwise.
+
+The bounds always satisfy `0 <= distance_lower <= D <= distance_upper <= 1`
+and their width is at most `4 * epsilon`. No p-value is computed.
+
+### Encode the check in a schema
+
+`Check.distribution_within` turns a profile into a regular column check. It is a
+*batch-level* check: it passes as a whole, fails as a whole, or reports an
+`uncertain` outcome as a {class}`~pandera.errors.DistributionUncertainError`.
+It sees the column after the usual schema preprocessing, dtype coercion and
+column parsers, so it compares the distribution that is actually validated.
+
+```{code-cell} python
+check = pa.Check.distribution_within(profile, tolerance=0.02)
+schema = pa.DataFrameSchema({"value": pa.Column("float64", check)})
+```
+
+The check deliberately rejects options that would silently change the compared
+population (`where`, `groupby`, `element_wise`, and non-default
+`head`/`tail`/`sample`). A confirmed `fail` respects `raise_warning=True`;
+an `uncertain` outcome always blocks, and `drop_invalid_rows=True` raises
+instead of guessing which rows to remove.
+
+You can also ask `infer_schema` to build the check for you. Pass the
+keyword-only `distribution` configuration, which must contain exactly
+`columns`, `epsilon` and `tolerance`:
+
+```{code-cell} python
+inferred = pa.infer_schema(
+    pd.DataFrame({"value": np.arange(0, 100_000, dtype="float64")}),
+    distribution={
+        "columns": ["value"],
+        "epsilon": 0.01,
+        "tolerance": 0.02,
+    },
+)
+print(inferred)
+```
+
+For the selected columns the profile check replaces the usual min/max checks;
+other columns, the index, nullability and dtype inference are unchanged. The
+same statistics can be reconstructed with
+{func}`~pandera.schema_statistics.pandas.parse_check_statistics`, and the
+profile travels with the schema through YAML/JSON export and import. A saved
+schema can be reloaded in a new process and will reproduce the same profile
+counts, bounds and decisions without the reference data.
+
+```{code-cell} python
+json_schema = inferred.to_json()
+reloaded = pa.DataFrameSchema.from_json(json_schema)
+print(reloaded.columns["value"].checks[0].name)
+```

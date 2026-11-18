@@ -101,6 +101,7 @@ from pandera.engines.pandas_engine import (
     pandas_version,
 )
 from pandera.schema_inference.pandas import infer_schema
+from pandera.numeric_profile import NumericProfile
 
 
 _future_warning = """Importing pandas-specific classes and functions from the
@@ -232,6 +233,8 @@ __all__ = [
     "MultiIndex",
     # schema_inference
     "infer_schema",
+    # numeric distribution profiles
+    "NumericProfile",
     # schemas
     "DataFrameSchema",
     "SeriesSchema",

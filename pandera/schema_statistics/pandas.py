@@ -1,17 +1,114 @@
 """Module for inferring the statistics of pandas objects."""
 
 import warnings
-from typing import Any, Dict, Union, List
+from typing import Any, Dict, List, Mapping, Union
 
 import pandas as pd
 
 from pandera import dtypes
 from pandera.api.checks import Check
 from pandera.engines import pandas_engine
+from pandera.errors import SchemaDefinitionError
+from pandera.numeric_profile import (
+    NumericProfile,
+    _is_supported_numeric_dtype,
+    validate_epsilon,
+    validate_tolerance,
+)
+
+DISTRIBUTION_KEYS = frozenset({"columns", "epsilon", "tolerance"})
 
 
-def infer_dataframe_statistics(df: pd.DataFrame) -> Dict[str, Any]:
-    """Infer column and index statistics from a pandas DataFrame."""
+def _validate_distribution_config(config: Any) -> Dict[str, Any]:
+    """Validate the ``distribution`` inference configuration."""
+    if not isinstance(config, Mapping):
+        raise TypeError(
+            "distribution must be a mapping with keys 'columns', 'epsilon' "
+            f"and 'tolerance', got {type(config).__name__}."
+        )
+    keys = set(config.keys())
+    if keys != DISTRIBUTION_KEYS:
+        raise ValueError(
+            "distribution config must contain exactly the keys 'columns', "
+            f"'epsilon' and 'tolerance', got {sorted(keys)}."
+        )
+    columns = config["columns"]
+    if isinstance(columns, (str, bytes)) or not isinstance(
+        columns, (list, tuple)
+    ):
+        raise TypeError(
+            "distribution['columns'] must be a sequence of column names, "
+            f"got {type(columns).__name__}."
+        )
+    if not columns:
+        raise ValueError("distribution['columns'] must not be empty.")
+    seen = set()
+    for name in columns:
+        if not isinstance(name, str):
+            raise TypeError(
+                "distribution['columns'] must contain strings, got "
+                f"{type(name).__name__}."
+            )
+        if name in seen:
+            raise ValueError(
+                f"distribution['columns'] contains duplicate name {name!r}."
+            )
+        seen.add(name)
+    return {
+        "columns": list(columns),
+        "epsilon": validate_epsilon(config["epsilon"]),
+        "tolerance": validate_tolerance(config["tolerance"]),
+    }
+
+
+def _selected_column_profile(
+    series: pd.Series, column_name: str, epsilon: float
+) -> NumericProfile:
+    if not _is_supported_numeric_dtype(series.dtype):
+        raise SchemaDefinitionError(
+            "distribution profiling only supports int64, float64, nullable "
+            f"Int64 and Float64 columns; column {column_name!r} has dtype "
+            f"{series.dtype!r}."
+        )
+    try:
+        return NumericProfile.from_batches([series], epsilon=epsilon)
+    except (TypeError, ValueError) as exc:
+        raise SchemaDefinitionError(
+            f"cannot build a distribution profile for column "
+            f"{column_name!r}: {exc}"
+        ) from exc
+
+
+def infer_dataframe_statistics(
+    df: pd.DataFrame, *, distribution: Any = None
+) -> Dict[str, Any]:
+    """Infer column and index statistics from a pandas DataFrame.
+
+    :param df: dataframe to infer statistics from.
+    :param distribution: optional keyword-only configuration with exactly the
+        keys ``columns``, ``epsilon`` and ``tolerance``. For each selected
+        numeric column the inferred checks are replaced by a single
+        distribution-profile check instead of the usual min/max bounds.
+    """
+    config = None
+    if distribution is not None:
+        config = _validate_distribution_config(distribution)
+        column_names = list(df.columns)
+        duplicated = {
+            name for name in config["columns"] if column_names.count(name) > 1
+        }
+        if duplicated:
+            raise SchemaDefinitionError(
+                "distribution columns must be unambiguous; the following "
+                f"names occur more than once: {sorted(duplicated)}."
+            )
+        for name in config["columns"]:
+            if name not in column_names:
+                raise SchemaDefinitionError(
+                    f"distribution column {name!r} does not exist in the "
+                    "dataframe."
+                )
+
     nullable_columns = df.isna().any()
     inferred_column_dtypes = {col: _get_array_type(df[col]) for col in df}
     column_statistics = {
@@ -22,14 +119,34 @@ def infer_dataframe_statistics(df: pd.DataFrame) -> Dict[str, Any]:
         }
         for col, dtype in inferred_column_dtypes.items()
     }
+
+    if config is not None:
+        for name in config["columns"]:
+            profile = _selected_column_profile(
+                df[name], name, config["epsilon"]
+            )
+            column_statistics[name]["checks"] = {
+                "distribution_within": {
+                    "profile": profile.to_dict(),
+                    "tolerance": config["tolerance"],
+                }
+            }
+
     return {
         "columns": column_statistics if column_statistics else None,
         "index": infer_index_statistics(df.index),
     }
 
 
-def infer_series_statistics(series: pd.Series) -> Dict[str, Any]:
+def infer_series_statistics(
+    series: pd.Series, *, distribution: Any = None
+) -> Dict[str, Any]:
     """Infer column and index statistics from a pandas Series."""
+    if distribution is not None:
+        raise SchemaDefinitionError(
+            "distribution profiling is only supported for DataFrameSchema "
+            "inference; a Series has no column names to select."
+        )
     dtype = _get_array_type(series)
     return {
         "dtype": dtype,
@@ -68,24 +185,30 @@ def infer_index_statistics(index: Union[pd.Index, pd.MultiIndex]):
 
 
 def parse_check_statistics(check_stats: Union[Dict[str, Any], None]):
-    """Convert check statistics to a list of Check objects, including their options."""
+    """Convert check statistics to a list of Check objects, including their options.
+
+    The input mapping is never modified: options are read from a copy, so a
+    statistics mapping can be parsed more than once (for example to construct
+    an identical schema repeatedly).
+    """
     if check_stats is None:
         return None
     checks = []
     for check_name, stats in check_stats.items():
         check = getattr(Check, check_name)
         try:
-            # Extract options if present
+            # Extract options if present, without mutating the input.
             if isinstance(stats, dict):
-                options = (
-                    stats.pop("options", {}) if "options" in stats else {}
-                )
+                stats = dict(stats)
+                options = stats.pop("options", {}) or {}
                 if stats:  # If there are remaining stats
                     check_instance = check(**stats)
                 else:  # Handle case where all stats were in options
                     check_instance = check()
                 # Apply options to the check instance
                 for option_name, option_value in options.items():
+                    if option_name == "check_name":
+                        continue
                     setattr(check_instance, option_name, option_value)
                 checks.append(check_instance)
             else:
@@ -169,8 +292,10 @@ def parse_checks(checks) -> Union[List[Dict[str, Any]], None]:
             )
             continue
 
-        # Get base statistics
-        base_stats = {} if check.statistics is None else check.statistics
+        # Get base statistics. Copy the mapping so that serialising a schema
+        # never mutates the Check (and, in particular, never mutates a stored
+        # distribution profile or its configuration).
+        base_stats = {} if check.statistics is None else dict(check.statistics)
 
         # Collect check options
         check_options = {

@@ -132,6 +132,66 @@ class SchemaWarning(UserWarning):
     """Warning when object does not pass schema validation constraints."""
 
 
+class DistributionError(SchemaError):
+    """Base class for batch-level distribution comparison errors.
+
+    These errors describe a whole-batch property and therefore never carry
+    per-row failure cases.  Instead the batch-level distance bounds, the
+    threshold and the effective reference sample size are exposed as
+    attributes so that error reports can read them:
+
+    ``distance_lower``, ``distance_upper``, ``tolerance`` and ``n``.
+    """
+
+    def __init__(
+        self,
+        message,
+        *,
+        distance_lower,
+        distance_upper,
+        tolerance,
+        n,
+        status,
+    ):
+        super().__init__(
+            schema=None,
+            data=None,
+            message=message,
+            # a batch-level outcome is reported as a single (scalar) failure
+            # case, never as one failure per record.
+            failure_cases=message,
+            check=None,
+            reason_code=SchemaErrorReason.DATAFRAME_CHECK,
+        )
+        self.distance_lower = distance_lower
+        self.distance_upper = distance_upper
+        self.tolerance = tolerance
+        self.n = n
+        self.status = status
+
+
+class DistributionCheckError(DistributionError):
+    """A batch was *confirmed* to drift beyond the configured tolerance."""
+
+    def __init__(self, message, **kwargs):
+        super().__init__(message, **kwargs)
+        # A confirmed drift is an ordinary whole-check failure.
+        self.reason_code = SchemaErrorReason.DATAFRAME_CHECK
+
+
+class DistributionUncertainError(DistributionError):
+    """The distance bounds straddle the tolerance.
+
+    This is neither a pass nor a confirmed drift: callers must not silently
+    treat it as either.  It is aggregated like a check-execution error under
+    lazy validation.
+    """
+
+    def __init__(self, message, **kwargs):
+        super().__init__(message, **kwargs)
+        self.reason_code = SchemaErrorReason.CHECK_ERROR
+
+
 class BaseStrategyOnlyError(Exception):
     """Custom error for reporting strategies that must be base strategies."""
 

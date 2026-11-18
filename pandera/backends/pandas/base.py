@@ -22,6 +22,8 @@ from pandera.backends.pandas.error_formatters import (
     reshape_failure_cases,
 )
 from pandera.errors import (
+    DistributionCheckError,
+    DistributionUncertainError,
     FailureCaseMetadata,
     SchemaError,
     SchemaErrorReason,
@@ -118,15 +120,49 @@ class PandasSchemaBackend(BaseSchemaBackend):
         :returns: True if check results pass or check.raise_warning=True, otherwise
             False.
         """
-        check_result: CheckResult = check(
-            check_obj,
-            *args,
-            validation_context=validation_context,
-            head=head,
-            tail=tail,
-            sample=sample,
-            random_state=random_state,
-        )
+        try:
+            check_result: CheckResult = check(
+                check_obj,
+                *args,
+                validation_context=validation_context,
+                head=head,
+                tail=tail,
+                sample=sample,
+                random_state=random_state,
+            )
+        except DistributionUncertainError as err:
+            # Uncertain distance bounds are neither a pass nor a confirmed
+            # drift. They are always blocking, even with raise_warning.
+            err.schema = schema
+            return CoreCheckResult(
+                passed=False,
+                check=check,
+                check_index=check_index,
+                reason_code=err.reason_code,
+                message=str(err),
+                failure_cases=err.failure_cases,
+                schema_error=err,
+                original_exc=err,
+            )
+        except DistributionCheckError as err:
+            err.schema = schema
+            if check.raise_warning:
+                warnings.warn(str(err), SchemaWarning)
+                return CoreCheckResult(
+                    passed=True,
+                    check=check,
+                    reason_code=SchemaErrorReason.DATAFRAME_CHECK,
+                )
+            return CoreCheckResult(
+                passed=False,
+                check=check,
+                check_index=check_index,
+                reason_code=err.reason_code,
+                message=str(err),
+                failure_cases=err.failure_cases,
+                schema_error=err,
+                original_exc=err,
+            )
 
         passed = check_result.check_passed
         failure_cases = None

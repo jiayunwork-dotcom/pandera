@@ -1,6 +1,7 @@
 """Data validation check definition."""
 
 import re
+from collections.abc import Mapping
 from typing import (
     Any,
     Callable,
@@ -653,4 +654,83 @@ class Check(BaseCheck):
             include_min,
             include_max,
             **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # Distribution profile check
+    # ------------------------------------------------------------------
+    @classmethod
+    def distribution_within(
+        cls,
+        profile,
+        *,
+        tolerance: float = 0.1,
+        **check_kwargs,
+    ) -> "Check":
+        """Ensure a column's distribution stays within a reference profile.
+
+        The check compares the whole (already preprocessed, coerced and
+        parser-transformed) pandas column of a validation batch against a
+        :class:`~pandera.numeric_profile.NumericProfile` built from reference
+        data.  It is a *batch-level* check: it either passes, fails as a
+        whole, or reports that the distance bounds cannot resolve the
+        threshold (an ``uncertain`` outcome surfaced as
+        :class:`~pandera.errors.DistributionUncertainError`).
+
+        :param profile: a :class:`~pandera.numeric_profile.NumericProfile`, or
+            its JSON-able mapping representation (as produced by schema
+            serialisation).
+        :param tolerance: distance threshold in ``[0, 1]``.  ``pass`` when the
+            upper distance bound is ``<= tolerance``, ``fail`` when the lower
+            bound is ``> tolerance``, ``uncertain`` otherwise.
+        :param check_kwargs: standard :class:`Check` options such as
+            ``raise_warning``, ``error``, ``title`` or ``description``.
+            Options that would silently change the compared population
+            (``where``, ``groupby``, ``groups`` or ``element_wise``) are
+            rejected.
+        """
+        # Imported lazily so that importing ``pandera.api.checks`` does not
+        # require numpy/pandas.
+        from pandera.numeric_profile import (
+            NumericProfile,
+            _distribution_within_check,
+            validate_tolerance,
+        )
+
+        forbidden = []
+        if check_kwargs.get("where") is not None:
+            forbidden.append("where")
+        if check_kwargs.get("groupby") is not None:
+            forbidden.append("groupby")
+        if check_kwargs.get("groups") is not None:
+            forbidden.append("groups")
+        if check_kwargs.get("element_wise", False):
+            forbidden.append("element_wise")
+        if forbidden:
+            raise errors.SchemaDefinitionError(
+                "Check.distribution_within does not support "
+                f"{forbidden}: these options would change the population "
+                "that is compared against the reference profile."
+            )
+        if not isinstance(profile, NumericProfile):
+            if isinstance(profile, Mapping):
+                profile = NumericProfile.from_dict(profile)
+            else:
+                raise TypeError(
+                    "profile must be a NumericProfile or a mapping "
+                    f"representation, got {type(profile).__name__}."
+                )
+        tol = validate_tolerance(tolerance)
+        statistics = {
+            "profile": profile.to_dict(),
+            "tolerance": tol,
+        }
+        return cls(
+            _distribution_within_check,
+            statistics=statistics,
+            name="distribution_within",
+            error=("distribution_within(profile, " f"tolerance={tol!r})"),
+            profile=profile,
+            tolerance=tol,
+            **check_kwargs,
         )

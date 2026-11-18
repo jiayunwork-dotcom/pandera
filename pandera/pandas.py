@@ -96,6 +96,7 @@ from pandera.engines.pandas_engine import (
     pandas_version,
 )
 from pandera.schema_inference.pandas import infer_schema
+from pandera.numeric_profile import NumericProfile
 
 
 external_config._set_pyspark_environment_variables()
@@ -171,6 +172,8 @@ __all__ = [
     "MultiIndex",
     # schema_inference
     "infer_schema",
+    # numeric distribution profiles
+    "NumericProfile",
     # schemas
     "DataFrameSchema",
     "SeriesSchema",

@@ -13,6 +13,7 @@ from pandera.backends.utils import convert_uniquesettings
 from pandera.config import ValidationScope
 from pandera.engines.pandas_engine import Engine
 from pandera.errors import (
+    DistributionError,
     ParserError,
     SchemaDefinitionError,
     SchemaError,
@@ -20,6 +21,11 @@ from pandera.errors import (
     SchemaErrors,
 )
 from pandera.validation_depth import validate_scope, validation_type
+
+
+def is_distribution_error(error) -> bool:
+    """Whether a collected error is a batch-level distribution outcome."""
+    return isinstance(error, DistributionError)
 
 
 class ArraySchemaBackend(PandasSchemaBackend):
@@ -42,7 +48,9 @@ class ArraySchemaBackend(PandasSchemaBackend):
         validation_context=None,
     ):
         # pylint: disable=too-many-locals
-        error_handler = ErrorHandler(lazy, validation_context=validation_context)
+        error_handler = ErrorHandler(
+            lazy, validation_context=validation_context
+        )
         check_obj = self.preprocess(check_obj, inplace)
 
         if is_field(check_obj):
@@ -100,6 +108,22 @@ class ArraySchemaBackend(PandasSchemaBackend):
                 if validation_context is not None and (
                     validation_context.has_unlocatable_error
                 ):
+                    raise SchemaErrors(
+                        schema=schema,
+                        schema_errors=error_handler.schema_errors,
+                        data=check_obj,
+                    )
+                if any(
+                    isinstance(err.failure_cases, str)
+                    and not is_distribution_error(err)
+                    for err in error_handler.schema_errors
+                ) or any(
+                    is_distribution_error(err)
+                    for err in error_handler.schema_errors
+                ):
+                    # A batch-level distribution outcome (fail or uncertain)
+                    # cannot be attributed to rows, so it must never cause a
+                    # silent guess-and-drop: raise the schema error instead.
                     raise SchemaErrors(
                         schema=schema,
                         schema_errors=error_handler.schema_errors,
@@ -189,12 +213,12 @@ class ArraySchemaBackend(PandasSchemaBackend):
                         row_positions=result.row_positions,
                         original_exc=result.original_exc,
                     )
-                    error_handler.collect_error(
-                        validation_type(result.reason_code),
-                        result.reason_code,
-                        error,
-                        original_exc=result.original_exc,
-                    )
+                error_handler.collect_error(
+                    validation_type(result.reason_code),
+                    result.reason_code,
+                    error,
+                    original_exc=result.original_exc,
+                )
 
         return error_handler
 
@@ -229,9 +253,7 @@ class ArraySchemaBackend(PandasSchemaBackend):
                 reason_code=SchemaErrorReason.DATATYPE_COERCION,
             ) from exc
 
-    def run_parsers(
-        self, schema, check_obj, validation_context=None
-    ):
+    def run_parsers(self, schema, check_obj, validation_context=None):
         parser_results: List[CoreParserResult] = []
         for parser_index, parser in enumerate(schema.parsers):
             parser_args = [None] if is_field(check_obj) else [schema.name]
@@ -406,6 +428,10 @@ class ArraySchemaBackend(PandasSchemaBackend):
                         random_state=random_state,
                     )
                 )
+            except SchemaDefinitionError:
+                # A check rejected its own configuration: surface it to the
+                # user instead of turning it into a data-level check error.
+                raise
             except Exception as err:  # pylint: disable=broad-except
                 # catch other exceptions that may occur when executing the Check
                 err_msg = f'"{err.args[0]}"' if len(err.args) > 0 else ""

@@ -16,28 +16,39 @@ from pandera.schema_statistics.pandas import (
 
 @overload
 def infer_schema(
-    pandas_obj: pd.Series,
+    pandas_obj: pd.Series, *, distribution=None
 ) -> SeriesSchema:  # pragma: no cover
     ...
 
 
 @overload
 def infer_schema(  # type: ignore[misc]
-    pandas_obj: pd.DataFrame,
+    pandas_obj: pd.DataFrame, *, distribution=None
 ) -> DataFrameSchema:  # pragma: no cover
     ...
 
 
-def infer_schema(pandas_obj):
+def infer_schema(pandas_obj, *, distribution=None):
     """Infer schema for pandas DataFrame or Series object.
 
     :param pandas_obj: DataFrame or Series object to infer.
+    :param distribution: optional keyword-only configuration with exactly the
+        keys ``columns``, ``epsilon`` and ``tolerance``. For each selected
+        numeric column, the inferred checks are replaced by a single
+        distribution-profile check (see
+        :meth:`pandera.api.checks.Check.distribution_within`) rather than the
+        usual reference min/max bounds.
     :returns: DataFrameSchema or SeriesSchema
     :raises: TypeError if pandas_obj is not expected type.
     """
     if isinstance(pandas_obj, pd.DataFrame):
-        return infer_dataframe_schema(pandas_obj)
+        return infer_dataframe_schema(pandas_obj, distribution=distribution)
     elif isinstance(pandas_obj, pd.Series):
+        if distribution is not None:
+            raise TypeError(
+                "distribution profiling is only supported when inferring a "
+                "DataFrameSchema; a Series has no column names to select."
+            )
         return infer_series_schema(pandas_obj)
     else:
         raise TypeError(
@@ -64,13 +75,17 @@ def _create_index(index_statistics):
     return index
 
 
-def infer_dataframe_schema(df: pd.DataFrame) -> DataFrameSchema:
+def infer_dataframe_schema(
+    df: pd.DataFrame, *, distribution=None
+) -> DataFrameSchema:
     """Infer a DataFrameSchema from a pandas DataFrame.
 
     :param df: DataFrame object to infer.
+    :param distribution: optional keyword-only distribution configuration,
+        see :func:`infer_schema`.
     :returns: DataFrameSchema
     """
-    df_statistics = infer_dataframe_statistics(df)
+    df_statistics = infer_dataframe_statistics(df, distribution=distribution)
     schema = DataFrameSchema(
         columns={
             colname: Column(

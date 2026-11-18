@@ -9,11 +9,11 @@ import pandas as pd
 from pandera.api.base.checks import CheckResult
 from pandera.api.checks import Check
 from pandera.api.pandas.types import (
+    GroupbyObject,
     is_bool,
     is_field,
     is_table,
     is_table_or_field,
-    GroupbyObject,
 )
 from pandera.backends.base import BaseCheckBackend
 
@@ -570,9 +570,7 @@ class PandasCheckBackend(BaseCheckBackend):
             if key is not None and key in full_table.columns:
                 # column-style table check: report the checked column's
                 # failing business values.
-                failed_values = full_table[key].iloc[
-                    sorted(failed_positions)
-                ]
+                failed_values = full_table[key].iloc[sorted(failed_positions)]
             else:
                 # table-level boolean Series check: report the boolean
                 # check result at each failing row.
@@ -676,6 +674,28 @@ class PandasCheckBackend(BaseCheckBackend):
             )
         return pd.DataFrame(records)
 
+    def _reject_distribution_sampling(self, head, tail, sample):
+        """Reject options that would silently change the compared population."""
+        from pandera.errors import SchemaDefinitionError
+
+        if (
+            self.check.groupby is not None
+            or self.check.groups is not None
+            or self.check.element_wise
+            or self.check.where is not None
+        ):
+            raise SchemaDefinitionError(
+                "Check.distribution_within does not support where, groupby, "
+                "groups or element_wise: these options would change the "
+                "population that is compared against the reference profile."
+            )
+        if head is not None or tail is not None or sample is not None:
+            raise SchemaDefinitionError(
+                "Check.distribution_within does not support head, tail or "
+                "sample: these options would compare only a subset of the "
+                "batch against the reference distribution."
+            )
+
     def __call__(
         self,
         check_obj: Union[pd.Series, pd.DataFrame],
@@ -686,6 +706,8 @@ class PandasCheckBackend(BaseCheckBackend):
         sample: Optional[int] = None,
         random_state: Optional[int] = None,
     ) -> CheckResult:
+        if self.check.name == "distribution_within":
+            self._reject_distribution_sampling(head, tail, sample)
         if self.check.where is not None:
             # conditional validation targets real pandas objects only;
             # dask/modin/pyspark.pandas frames share this backend but lack
