@@ -126,6 +126,12 @@ class SchemaError(ReducedPickleExceptionBase):
         # the error cannot be attributed to concrete physical rows.
         self.row_positions = row_positions
         self.original_exc = original_exc
+        # True for structural / conversion / parser-execution failures that
+        # cannot be repaired by ``drop_invalid_rows``. The flag travels with
+        # the error across nested error handlers so the outermost drop
+        # decision can see it even when the error is re-raised and
+        # re-collected.
+        self.non_row_error = False
 
 
 class SchemaWarning(UserWarning):

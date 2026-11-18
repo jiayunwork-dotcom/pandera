@@ -65,23 +65,25 @@ class ArraySchemaBackend(PandasSchemaBackend):
             check_obj = self.set_default(check_obj, schema)
 
         # run custom parsers
-        check_obj = self.run_parsers(
-            schema, check_obj, validation_context=validation_context
+        check_obj, parser_failed = self.run_parsers(
+            schema, check_obj, error_handler, validation_context
         )
 
-        try:
-            if is_field(check_obj) and schema.coerce:
-                check_obj = self.coerce_dtype(check_obj, schema=schema)
-            elif schema.coerce:
-                check_obj[schema.name] = self.coerce_dtype(
-                    check_obj[schema.name], schema=schema
+        if not parser_failed:
+            try:
+                if is_field(check_obj) and schema.coerce:
+                    check_obj = self.coerce_dtype(check_obj, schema=schema)
+                elif schema.coerce:
+                    check_obj[schema.name] = self.coerce_dtype(
+                        check_obj[schema.name], schema=schema
+                    )
+            except SchemaError as exc:
+                error_handler.mark_non_row_error(exc)
+                error_handler.collect_error(
+                    validation_type(exc.reason_code),
+                    exc.reason_code,
+                    exc,
                 )
-        except SchemaError as exc:
-            error_handler.collect_error(
-                validation_type(exc.reason_code),
-                exc.reason_code,
-                exc,
-            )
 
         # run the core checks
         error_handler = self.run_checks_and_handle_errors(
@@ -97,9 +99,12 @@ class ArraySchemaBackend(PandasSchemaBackend):
 
         if lazy and error_handler.collected_errors:
             if getattr(schema, "drop_invalid_rows", False):
-                if validation_context is not None and (
-                    validation_context.has_unlocatable_error
+                if error_handler.has_non_row_error or (
+                    validation_context is not None
+                    and validation_context.has_unlocatable_error
                 ):
+                    # structural/coercion/parser failures cannot be repaired
+                    # by deleting rows.
                     raise SchemaErrors(
                         schema=schema,
                         schema_errors=error_handler.schema_errors,
@@ -230,27 +235,172 @@ class ArraySchemaBackend(PandasSchemaBackend):
             ) from exc
 
     def run_parsers(
-        self, schema, check_obj, validation_context=None
+        self, schema, check_obj, error_handler, validation_context=None
     ):
+        """Run component-level parsers, collecting execution failures.
+
+        Returns ``(check_obj, parser_failed)``. On failure the chain stops, the
+        last valid object is returned (the illegal output is discarded) and a
+        ``CHECK_ERROR`` attributed to the parser is collected.
+        """
         parser_results: List[CoreParserResult] = []
+        parser_failed = False
         for parser_index, parser in enumerate(schema.parsers):
             parser_args = [None] if is_field(check_obj) else [schema.name]
             before = check_obj
-            result = self.run_parser(
-                check_obj,
-                parser,
-                parser_index,
-                *parser_args,
-            )
+            try:
+                result = self.run_parser(
+                    check_obj,
+                    parser,
+                    parser_index,
+                    *parser_args,
+                )
+            except SchemaError as err:
+                self._collect_parser_failure(
+                    schema,
+                    check_obj,
+                    parser,
+                    parser_index,
+                    err,
+                    error_handler,
+                )
+                parser_failed = True
+                break
+            except Exception as err:  # pylint: disable=broad-except
+                self._collect_parser_failure(
+                    schema,
+                    check_obj,
+                    parser,
+                    parser_index,
+                    err,
+                    error_handler,
+                )
+                parser_failed = True
+                break
+
             check_obj = result.parser_output
             parser_results.append(result)
-            if validation_context is not None and is_table(before):
-                validation_context.assert_parser_preserves_rows(
+
+            # validate the row layout of the parser output. In conditional mode
+            # this also guards physical row positions.
+            try:
+                if not is_table(check_obj) and not isinstance(
+                    check_obj, pd.Series
+                ):
+                    raise SchemaError(
+                        schema=schema,
+                        data=before,
+                        message=(
+                            f"Parser "
+                            f"{getattr(parser, 'name', parser_index)!r} must "
+                            "return a pandas Series or DataFrame, got "
+                            f"{type(check_obj).__name__}."
+                        ),
+                        failure_cases=type(check_obj).__name__,
+                        check=getattr(
+                            parser, "name", f"parser_{parser_index}"
+                        ),
+                        reason_code=SchemaErrorReason.CHECK_ERROR,
+                    )
+                if validation_context is not None and is_table(before):
+                    validation_context.assert_parser_preserves_rows(
+                        before,
+                        check_obj,
+                        getattr(parser, "name", f"parser_{parser_index}"),
+                    )
+                elif is_field(before) and isinstance(check_obj, pd.Series):
+                    if (
+                        len(check_obj) != len(before)
+                        or not check_obj.index.equals(before.index)
+                    ):
+                        raise SchemaError(
+                            schema=schema,
+                            data=before,
+                            message=(
+                                f"Column parser "
+                                f"{getattr(parser, 'name', parser_index)!r} "
+                                "returned a Series with a number of rows or an "
+                                "index sequence that does not match the "
+                                "validated object."
+                            ),
+                            failure_cases=getattr(
+                                parser, "name", f"parser_{parser_index}"
+                            ),
+                            check=getattr(
+                                parser, "name", f"parser_{parser_index}"
+                            ),
+                            reason_code=SchemaErrorReason.CHECK_ERROR,
+                        )
+            except SchemaError as err:
+                self._collect_parser_failure(
+                    schema,
                     before,
-                    check_obj,
-                    getattr(parser, "name", f"parser_{parser_index}"),
+                    parser,
+                    parser_index,
+                    err,
+                    error_handler,
                 )
-        return check_obj
+                check_obj = before
+                parser_failed = True
+                break
+        return check_obj, parser_failed
+
+    @staticmethod
+    def _collect_parser_failure(
+        schema,
+        check_obj,
+        parser,
+        parser_index,
+        original_exc,
+        error_handler,
+    ):
+        """Build and collect a CHECK_ERROR SchemaError for a failed parser."""
+        if isinstance(original_exc, SchemaError):
+            exc = original_exc
+            exc.parser = exc.parser or parser
+            exc.parser_index = (
+                exc.parser_index
+                if exc.parser_index is not None
+                else parser_index
+            )
+            if exc.reason_code is None:
+                exc.reason_code = SchemaErrorReason.CHECK_ERROR
+            reason_code = exc.reason_code
+            chained = getattr(exc, "original_exc", None)
+        else:
+            import traceback
+
+            err_msg = (
+                f'"{original_exc.args[0]}"'
+                if original_exc.args
+                else ""
+            )
+            err_str = f"{original_exc.__class__.__name__}({err_msg})"
+            reason_code = SchemaErrorReason.CHECK_ERROR
+            exc = SchemaError(
+                schema=schema,
+                data=check_obj,
+                message=(
+                    f"Error while executing parser "
+                    f"{getattr(parser, 'name', parser_index)!r}: "
+                    f"{err_str}\n{traceback.format_exc()}"
+                ),
+                failure_cases=err_str,
+                check=getattr(parser, "name", f"parser_{parser_index}"),
+                parser=parser,
+                parser_index=parser_index,
+                reason_code=reason_code,
+                original_exc=original_exc,
+            )
+            chained = original_exc
+
+        error_handler.mark_non_row_error(exc)
+        error_handler.collect_error(
+            validation_type(reason_code),
+            reason_code,
+            exc,
+            chained,
+        )
 
     @validate_scope(scope=ValidationScope.SCHEMA)
     def check_name(self, check_obj: pd.Series, schema) -> CoreCheckResult:

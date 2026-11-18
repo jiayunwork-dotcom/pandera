@@ -70,8 +70,26 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         if hasattr(check_obj, "pandera"):
             check_obj = check_obj.pandera.add_schema(schema)
 
-        # run custom parsers
-        check_obj = self.run_parsers(schema, check_obj)
+        # The conditional context is created before any preprocessing so that
+        # structural/coercion errors raised by the core preprocessors are not
+        # lost when the schema contains `where` checks. The physical row table
+        # is rebound once preprocessing finishes; no `where` callable can run
+        # before that point.
+        validation_context = (
+            ConditionalValidationContext(check_obj)
+            if self.schema_has_where_checks(schema)
+            else None
+        )
+        if validation_context is not None:
+            error_handler = ErrorHandler(
+                lazy, validation_context=validation_context
+            )
+
+        # run custom schema-level parsers. A parser that raises produces a
+        # collectable CHECK_ERROR; the parser chain stops and every later step
+        # works against the last valid table, so a parser's illegal output can
+        # never replace the validated table or feed subsequent parsers/checks.
+        check_obj = self.run_parsers(schema, check_obj, error_handler)
 
         # Collect status of columns against schema
         column_info = self.collect_column_info(check_obj, schema)
@@ -87,10 +105,13 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
             try:
                 check_obj = parser(check_obj, *args)
             except SchemaError as exc:
+                error_handler.mark_non_row_error(exc)
                 error_handler.collect_error(
                     validation_type(exc.reason_code), exc.reason_code, exc
                 )
             except SchemaErrors as exc:
+                for schema_error in exc.schema_errors:
+                    error_handler.mark_non_row_error(schema_error)
                 error_handler.collect_errors(exc.schema_errors)
 
         # conditional (`where`) validation requires a stable notion of
@@ -98,15 +119,8 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         # reorder/filter rows, and positions are computed against the table
         # that exists once all schema-level preprocessing is done. Column
         # parsers afterwards must keep the row sequence fixed.
-        validation_context = (
-            ConditionalValidationContext(check_obj)
-            if self.schema_has_where_checks(schema)
-            else None
-        )
         if validation_context is not None:
-            error_handler = ErrorHandler(
-                lazy, validation_context=validation_context
-            )
+            validation_context.bind_full_table(check_obj)
 
         # We may have modified columns, for example by
         # add_missing_columns, so regenerate column info
@@ -134,14 +148,15 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
 
         if error_handler.collected_errors:
             if getattr(schema, "drop_invalid_rows", False):
-                # if the failure cases are a string, it means the error is
-                # a schema-level error.
-                if any(
-                    isinstance(err.failure_cases, str)
-                    for err in error_handler.schema_errors
-                ) or (
-                    validation_context is not None
-                    and validation_context.has_unlocatable_error
+                # structural errors, unfinished coercion and parser execution
+                # failures cannot be repaired by deleting rows, and neither can
+                # any error without reliable physical row positions.
+                if (
+                    error_handler.has_non_row_error
+                    or (
+                        validation_context is not None
+                        and validation_context.has_unlocatable_error
+                    )
                 ):
                     raise SchemaErrors(
                         schema=schema,
@@ -211,6 +226,7 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     tail=tail,
                     sample=sample,
                     random_state=random_state,
+                    error_handler=error_handler,
                 ),
             ),
             (
@@ -269,6 +285,7 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
         tail: Optional[int] = None,
         sample: Optional[int] = None,
         random_state: Optional[int] = None,
+        error_handler: Optional[ErrorHandler] = None,
     ) -> List[CoreCheckResult]:
         """Run checks for all schema components."""
         check_results = []
@@ -302,6 +319,10 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
 
                 check_passed.append(is_table(result))
             except SchemaError as err:
+                if error_handler is not None and getattr(
+                    err, "non_row_error", False
+                ):
+                    error_handler.mark_non_row_error(err)
                 check_results.append(
                     CoreCheckResult(
                         passed=False,
@@ -312,6 +333,13 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     )
                 )
             except SchemaErrors as err:
+                if error_handler is not None and any(
+                    getattr(e, "non_row_error", False)
+                    for e in err.schema_errors
+                ):
+                    for schema_error in err.schema_errors:
+                        if getattr(schema_error, "non_row_error", False):
+                            error_handler.mark_non_row_error(schema_error)
                 check_results.extend(
                     [
                         CoreCheckResult(
@@ -757,10 +785,14 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                     check=f"coerce_dtype('{schema.dtype}')",
                 ) from exc
 
-        def _try_coercion(coerce_fn, obj):
+        def _try_coercion(coerce_fn, obj, column_name=None):
             try:
                 return coerce_fn(obj)
             except SchemaError as exc:
+                # attribute the failure to the actual (e.g. regex-matched)
+                # column rather than the schema-level pattern name.
+                if column_name is not None:
+                    exc.column_name = column_name
                 error_handler.collect_error(
                     validation_type(SchemaErrorReason.DATATYPE_COERCION),
                     SchemaErrorReason.DATATYPE_COERCION,
@@ -784,7 +816,9 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                         _col_schema = copy.deepcopy(col_schema)
                         _col_schema.coerce = True
                         obj[matched_colname] = _try_coercion(
-                            _col_schema.coerce_dtype, obj[matched_colname]
+                            _col_schema.coerce_dtype,
+                            obj[matched_colname],
+                            column_name=matched_colname,
                         )
             elif (
                 (col_schema.coerce or schema.coerce)
@@ -794,7 +828,9 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
                 _col_schema = copy.deepcopy(col_schema)
                 _col_schema.coerce = True
                 obj[colname] = _try_coercion(
-                    _col_schema.coerce_dtype, obj[colname]
+                    _col_schema.coerce_dtype,
+                    obj[colname],
+                    column_name=colname,
                 )
 
         if schema.dtype is not None:
@@ -818,18 +854,96 @@ class DataFrameSchemaBackend(PandasSchemaBackend):
 
         return obj
 
-    def run_parsers(self, schema, check_obj):
-        """Run parsers"""
+    def run_parsers(self, schema, check_obj, error_handler=None):
+        """Run schema-level parsers, collecting execution failures.
+
+        On success each parser output replaces the working table exactly once.
+        A parser that raises is reported as a ``CHECK_ERROR`` attributed to the
+        parser; the chain then stops and the last valid table is returned so
+        downstream steps never consume an illegal output.
+        """
         parser_results: List[CoreParserResult] = []
         for parser_index, parser in enumerate(schema.parsers):
-            result = self.run_parser(
-                check_obj,
-                parser,
-                parser_index,
-            )
+            try:
+                result = self.run_parser(
+                    check_obj,
+                    parser,
+                    parser_index,
+                )
+            except SchemaError as err:
+                # an explicit SchemaError raised inside a parser keeps its
+                # reason code but is treated as a parser execution failure for
+                # aggregation purposes.
+                self._collect_parser_error(
+                    error_handler,
+                    schema,
+                    check_obj,
+                    parser,
+                    parser_index,
+                    err,
+                )
+                break
+            except Exception as err:  # pylint: disable=broad-except
+                self._collect_parser_error(
+                    error_handler,
+                    schema,
+                    check_obj,
+                    parser,
+                    parser_index,
+                    err,
+                )
+                break
             check_obj = result.parser_output
             parser_results.append(result)
         return check_obj
+
+    @staticmethod
+    def _collect_parser_error(
+        error_handler,
+        schema,
+        check_obj,
+        parser,
+        parser_index,
+        original_exc,
+    ):
+        """Turn a failed parser execution into a collected SchemaError."""
+        if isinstance(original_exc, SchemaError):
+            exc = original_exc
+            if exc.reason_code is None:
+                exc.reason_code = SchemaErrorReason.CHECK_ERROR
+            reason_code = exc.reason_code
+        else:
+            err_msg = (
+                f'"{original_exc.args[0]}"'
+                if original_exc.args
+                else ""
+            )
+            err_str = (
+                f"{original_exc.__class__.__name__}({err_msg})"
+            )
+            reason_code = SchemaErrorReason.CHECK_ERROR
+            exc = SchemaError(
+                schema=schema,
+                data=check_obj,
+                message=(
+                    f"Error while executing parser "
+                    f"{getattr(parser, 'name', parser_index)!r}: "
+                    f"{err_str}\n{traceback.format_exc()}"
+                ),
+                failure_cases=err_str,
+                check=getattr(parser, "name", f"parser_{parser_index}"),
+                parser=parser,
+                parser_index=parser_index,
+                reason_code=reason_code,
+                original_exc=original_exc,
+            )
+        if error_handler is None:
+            exc.non_row_error = True
+            raise exc
+        error_handler.mark_non_row_error(exc)
+        error_handler.collect_error(
+            validation_type(reason_code), reason_code, exc, original_exc
+        )
 
     ##########
     # Checks #

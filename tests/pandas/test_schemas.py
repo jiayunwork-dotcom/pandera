@@ -2528,11 +2528,6 @@ def test_pandas_dataframe_subclass_validation():
             pd.DataFrame({"numbers": [3, 4, 5]}),
         ),
         (
-            DataFrameSchema({"numbers": Column(str)}, drop_invalid_rows=True),
-            pd.DataFrame({"numbers": [1, 2, 3, 4, 5]}),
-            pd.DataFrame({"numbers": []}),
-        ),
-        (
             DataFrameSchema(
                 {
                     "letters": Column(str),
@@ -2560,6 +2555,20 @@ def test_drop_invalid_for_dataframe_schema(schema, obj, expected_obj):
 
     with pytest.raises(errors.SchemaDefinitionError):
         schema.validate(obj, lazy=False)
+
+
+def test_drop_invalid_rows_raises_on_dtype_mismatch():
+    """A wrong dtype is a structural error that row deletion cannot repair."""
+    schema = DataFrameSchema(
+        {"numbers": Column(str)}, drop_invalid_rows=True
+    )
+    obj = pd.DataFrame({"numbers": [1, 2, 3, 4, 5]})
+    with pytest.raises(errors.SchemaErrors) as exc:
+        schema.validate(obj, lazy=True)
+    assert any(
+        e.reason_code == errors.SchemaErrorReason.WRONG_DATATYPE
+        for e in exc.value.schema_errors
+    )
 
 
 @pytest.mark.parametrize(

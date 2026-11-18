@@ -36,6 +36,26 @@ are removed. Errors that cannot be attributed to concrete rows (scalar
 raise `SchemaErrors` instead of dropping a guessed set of rows.
 ```
 
+```{note}
+Row deletion can only repair *data-level* check failures. Structural and
+conversion failures are not attributable to individual rows and cannot be
+fixed by removing them, so they always raise `SchemaErrors` even with
+`drop_invalid_rows=True`:
+
+- unknown or out-of-order columns (`strict`/`ordered`), missing required
+  columns and duplicate column labels,
+- dtype mismatches (`WRONG_DATATYPE`) and failed coercion
+  (`DATATYPE_COERCION`, including the original un-coercible values),
+- parser execution failures and parsers that return an illegal row layout
+  (a changed row count or index sequence).
+
+When such an error occurs together with ordinary row-level failures, both
+kinds of diagnostics are present on the raised `SchemaErrors`; the bad rows
+are simply not dropped. A failed column parser's illegal output never
+replaces the validated table, and checks that would consume that output are
+skipped rather than fabricated.
+```
+
 Dropping invalid rows with {class}`~pandera.api.pandas.container.DataFrameSchema`:
 
 ```{code-cell} python

@@ -10,6 +10,7 @@ import pandera.pandas as pa
 from pandera.api.parsers import Parser
 from pandera.errors import (
     SchemaDefinitionError,
+    SchemaErrorReason,
     SchemaErrors,
 )
 
@@ -813,7 +814,7 @@ def test_row_changing_column_parser_is_rejected():
         columns={
             "v": pa.Column(
                 int,
-                parsers=[Parser(lambda s: s.iloc[:-1])],
+                parsers=[Parser(lambda s: s.iloc[:-1], name="shrink")],
                 checks=pa.Check(
                     lambda s: s > 0, name="p", where=lambda d: d["flag"]
                 ),
@@ -821,8 +822,25 @@ def test_row_changing_column_parser_is_rejected():
             "flag": pa.Column(bool),
         }
     )
-    with pytest.raises(SchemaDefinitionError, match="row"):
+    # an illegal parser row layout is a collectable CHECK_ERROR, not an
+    # immediately raised SchemaDefinitionError: lazy validation must still
+    # finish the independent branches and aggregate everything.
+    with pytest.raises(SchemaErrors) as exc:
         schema.validate(df, lazy=True)
+    reason_codes = [e.reason_code for e in exc.value.schema_errors]
+    assert SchemaErrorReason.CHECK_ERROR in reason_codes
+    parser_errors = [
+        e
+        for e in exc.value.schema_errors
+        if e.reason_code == SchemaErrorReason.CHECK_ERROR
+    ]
+    assert all(e.column_name == "v" for e in parser_errors)
+    assert any(e.check == "shrink" for e in parser_errors)
+    # the dependent check of column v never ran: no fabricated record for it
+    assert not any(
+        getattr(e.check, "name", None) == "p"
+        for e in exc.value.schema_errors
+    )
 
 
 # ---------------------------------------------------------------------------

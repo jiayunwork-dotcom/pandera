@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, FrozenSet, Optional
 import numpy as np
 import pandas as pd
 
-from pandera.errors import SchemaDefinitionError, SchemaError, SchemaErrorReason
+from pandera.errors import SchemaError, SchemaErrorReason
 
 
 def coerce_boolean_mask(mask: Any, full_table: pd.DataFrame) -> pd.Series:
@@ -126,6 +126,10 @@ class ConditionalValidationContext:
     """Bookkeeping shared by every check of one validation run."""
 
     def __init__(self, full_table: pd.DataFrame):
+        # The table can be rebound exactly once: schema-level parsers and the
+        # other core preprocessors (strict/filter, defaults, coercion) may
+        # legitimately reorder or filter rows, and physical positions must
+        # describe the table that exists once preprocessing is done.
         self._full_table = full_table
         self._mask_cache: Dict[int, pd.Series] = {}
         self._where_call_counts: Dict[int, int] = {}
@@ -139,6 +143,16 @@ class ConditionalValidationContext:
     @property
     def full_table(self) -> pd.DataFrame:
         return self._full_table
+
+    def bind_full_table(self, full_table: pd.DataFrame) -> None:
+        """Rebind the table defining physical row positions.
+
+        Called once, after the schema-level preprocessors finish. Any cached
+        masks were computed against the pre-preprocessing table and would no
+        longer line up positionally, so they are discarded.
+        """
+        self._full_table = full_table
+        self._mask_cache = {}
 
     @property
     def n_rows(self) -> int:
@@ -265,13 +279,22 @@ class ConditionalValidationContext:
         """Reject column parsers that change row count or the index sequence.
 
         Physical row positions would otherwise no longer map to the table the
-        ``where`` masks describe.
+        ``where`` masks describe. The failure is reported as a collectable
+        ``CHECK_ERROR`` (rather than raised immediately) so lazy validation can
+        keep reporting the independent checks of other columns.
         """
         if len(before) != len(after) or not before.index.equals(after.index):
-            raise SchemaDefinitionError(
-                f"Column parser {parser_name!r} changed the number of rows "
-                "or the index sequence while conditional (`where`) checks "
-                "are enabled. Conditional validation requires column "
-                "parsers to preserve row count and index order; move row "
-                "filtering into a schema-level parser."
+            raise SchemaError(
+                schema=None,
+                data=before,
+                message=(
+                    f"Column parser {parser_name!r} changed the number of rows "
+                    "or the index sequence while conditional (`where`) checks "
+                    "are enabled. Conditional validation requires column "
+                    "parsers to preserve row count and index order; move row "
+                    "filtering into a schema-level parser."
+                ),
+                failure_cases=parser_name,
+                check=parser_name,
+                reason_code=SchemaErrorReason.CHECK_ERROR,
             )

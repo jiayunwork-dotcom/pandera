@@ -131,9 +131,7 @@ schema.validate(pd.DataFrame({"string_numbers": ["12345", "67890"]}))
 ## Parsing the dataframe
 
 For any dataframe-wide preprocessing logic, you can specify the `parsers`
-kwarg in the `DataFrameSchema` object.
-
-```{code-cell} python
+kwarg in the `DataFrameSchema` object.```{code-cell} python
 schema = pa.DataFrameSchema(
     parsers=pa.Parser(lambda df: df.transform("sqrt")),
     columns={
@@ -181,3 +179,29 @@ class DFModel(pa.DataFrameModel):
     def plus_one(cls, series):
         return series + 1
 ```
+
+## Parser failures
+
+A parser can fail in two ways: it can raise an ordinary exception, or it can
+return an object with an illegal row layout (a column parser that changes the
+number of rows or the index sequence). In both cases the failure is reported
+as a `CHECK_ERROR` `SchemaError` attributed to the parser and, for column
+parsers, to the actual column name (including the concrete columns matched by
+a `regex=True` declaration). The original exception is available on
+`SchemaError.original_exc` (and through the exception chain).
+
+Under `lazy=True` the failure is collected rather than raised immediately:
+
+- the parser's illegal output is discarded and never replaces the validated
+  table;
+- later parsers in the same chain and the checks of that column are skipped,
+  because they would consume output that does not exist (no success or failure
+  record is fabricated for them);
+- parsers and checks of *other* columns still run independently;
+- the run finishes with a single `SchemaErrors` aggregating every structural,
+  coercion, parser and check error that actually occurred.
+
+Parser failures cannot be repaired by deleting rows, so
+`drop_invalid_rows=True` still raises `SchemaErrors` when one occurs. With
+`lazy=False` the first failure keeps raising a `SchemaError` as soon as it is
+encountered.

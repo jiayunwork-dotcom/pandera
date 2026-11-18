@@ -36,11 +36,27 @@ class ErrorHandler:
         self._schema_errors: List[SchemaError] = []
         self._summarized_errors = defaultdict(lambda: defaultdict(list))  # type: ignore
         self.validation_context = validation_context
+        # Structural errors, unfinished coercion/parsing and parser execution
+        # failures can never be repaired by deleting rows. This flag lets the
+        # final ``drop_invalid_rows`` step know that dropping must not run.
+        self.has_non_row_error = False
 
     @property
     def lazy(self) -> bool:
         """Whether or not the schema error handler raises errors immediately."""
         return self._lazy
+
+    def mark_non_row_error(self, schema_error=None) -> None:
+        """Record that an error not attributable to concrete rows occurred.
+
+        :param schema_error: when provided, the error is tagged directly so
+            the classification survives re-collection by a parent handler.
+        """
+        self.has_non_row_error = True
+        if schema_error is not None:
+            schema_error.non_row_error = True
+        if self.validation_context is not None:
+            self.validation_context.mark_unlocatable_error()
 
     def collect_error(
         self,
@@ -65,6 +81,12 @@ class ErrorHandler:
             del schema_error.data
 
         schema_error.data = None
+
+        # structural / conversion / parser-execution failures are marked on the
+        # error itself so the classification survives being re-raised and
+        # re-collected across nested error handlers.
+        if getattr(schema_error, "non_row_error", False):
+            self.has_non_row_error = True
 
         # conditional validation: accumulate the exact physical rows each
         # error attributes, and flag errors that cannot be located so the

@@ -342,7 +342,10 @@ function, or a missing required column. In drop mode pandera then raises
   raised at construction time.
 - Column parsers may change values but, while a `where` check is present,
   must not change the row count or index sequence; row filtering belongs in
-  a schema-level parser, whose resulting table defines the row positions.
+  a schema-level parser, whose resulting table defines the row positions. A
+  column parser that changes the row layout anyway is reported as a
+  `CHECK_ERROR` (under `lazy=True`, aggregated into `SchemaErrors` alongside
+  the other branches), and its checks are skipped.
 
 ## Raise Warning Instead of Error on Check Failure
 

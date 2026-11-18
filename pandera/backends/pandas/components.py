@@ -29,6 +29,24 @@ from pandera.errors import (
 from pandera.validation_depth import validation_type
 
 
+# Reason codes that describe structural / conversion failures rather than
+# individual bad rows. They cannot be repaired by ``drop_invalid_rows``.
+_NON_ROW_REASON_CODES = frozenset(
+    {
+        SchemaErrorReason.DATATYPE_COERCION,
+        SchemaErrorReason.WRONG_DATATYPE,
+        SchemaErrorReason.WRONG_FIELD_NAME,
+        SchemaErrorReason.COLUMN_NOT_IN_DATAFRAME,
+        SchemaErrorReason.COLUMN_NOT_IN_SCHEMA,
+        SchemaErrorReason.COLUMN_NOT_ORDERED,
+        SchemaErrorReason.DUPLICATE_COLUMN_LABELS,
+        SchemaErrorReason.INVALID_COLUMN_NAME,
+        SchemaErrorReason.ADD_MISSING_COLUMN_NO_DEFAULT,
+        SchemaErrorReason.MISMATCH_INDEX,
+    }
+)
+
+
 class ColumnBackend(ArraySchemaBackend):
     """Backend implementation for pandas dataframe columns."""
 
@@ -95,11 +113,15 @@ class ColumnBackend(ArraySchemaBackend):
             except SchemaErrors as errs:
                 for err in errs.schema_errors:
                     err.column_name = column_name
+                    if err.reason_code in _NON_ROW_REASON_CODES:
+                        error_handler.mark_non_row_error(err)
                     error_handler.collect_error(
                         validation_type(err.reason_code), err.reason_code, err
                     )
             except SchemaError as err:
                 err.column_name = column_name
+                if err.reason_code in _NON_ROW_REASON_CODES:
+                    error_handler.mark_non_row_error(err)
                 error_handler.collect_error(
                     validation_type(err.reason_code), err.reason_code, err
                 )
@@ -122,6 +144,9 @@ class ColumnBackend(ArraySchemaBackend):
                         schema=schema,
                     )
                 except SchemaErrors as exc:
+                    for schema_error in exc.schema_errors:
+                        schema_error.column_name = column_name
+                        error_handler.mark_non_row_error(schema_error)
                     error_handler.collect_errors(exc.schema_errors)
 
             if is_table(check_obj[column_name]):
@@ -133,60 +158,77 @@ class ColumnBackend(ArraySchemaBackend):
                     )
                     if schema.parsers:
                         check_obj[column_name] = validated_column
-            else:
-                if (
-                    getattr(schema, "drop_invalid_rows", False)
-                    and validation_context is None
-                ):
-                    # replace the check_obj with the validated. In
-                    # conditional mode rows are dropped once, at the end of
-                    # the whole schema validation, using physical positions;
-                    # the column backend only accumulates failure positions.
-                    check_obj = validate_column(
-                        check_obj, column_name, return_check_obj=True
-                    )
-                    validated_column = check_obj
-                elif schema.parsers and validation_context is not None:
-                    # Column parsers return the parsed Series (or column),
-                    # but conditional checks must keep seeing the full table
-                    # since the `where` callable may read other columns.
-                    # Run the parsers directly (once), verify they preserved
-                    # the row sequence, write the parsed column back, then run
-                    # the check pass once against the reassembled table using
-                    # a parser-free copy so parsers are not re-executed.
-                    parsed = self._run_column_parsers(
-                        check_obj, schema, column_name, validation_context
-                    )
+                continue
+
+            # Run the column's parsers once. A failed parser or an output with
+            # an illegal row layout is reported as a CHECK_ERROR attributed to
+            # the actual column and parser; the bad output is discarded so it
+            # can never overwrite the valid table, and the column's checks are
+            # skipped (they would consume parser output that does not exist).
+            # Other columns continue independently.
+            parser_failure = None
+            if schema.parsers:
+                parsed, parser_failure = self._run_column_parsers_safely(
+                    check_obj,
+                    schema,
+                    column_name,
+                    validation_context,
+                    error_handler,
+                )
+                if parser_failure is None:
                     if isinstance(parsed, pd.Series):
                         check_obj[column_name] = parsed
                     elif is_table(parsed) and column_name in parsed.columns:
                         check_obj[column_name] = parsed[column_name]
                     else:
                         check_obj = parsed
-                    check_only = self._check_only_component(schema)
-                    validated_column = check_only.get_backend(check_obj).validate(
-                        check_obj,
-                        schema=check_only.set_name(column_name),
-                        head=head,
-                        tail=tail,
-                        sample=sample,
-                        random_state=random_state,
-                        lazy=lazy,
-                        inplace=True,
-                        validation_context=validation_context,
-                    )
-                else:
-                    validated_column = validate_column(
-                        check_obj,
-                        column_name,
-                        return_check_obj=True,
-                    )
 
-                if schema.parsers:
-                    if isinstance(validated_column, pd.Series):
-                        check_obj[column_name] = validated_column
-                    elif is_table(validated_column):
-                        check_obj[column_name] = validated_column[column_name]
+            if parser_failure is not None:
+                # the check pass relies on parser-produced values that do not
+                # exist; do not fabricate success or failure records for it.
+                continue
+
+            if schema.parsers:
+                # Parsers have already run exactly once. Reassemble the table
+                # (conditional checks must keep seeing every column because the
+                # `where` callable may read other columns) and run only the
+                # checks via a parser-free copy so parsers are not re-executed.
+                check_only = self._check_only_component(schema)
+                validated_column = check_only.get_backend(check_obj).validate(
+                    check_obj,
+                    schema=check_only.set_name(column_name),
+                    head=head,
+                    tail=tail,
+                    sample=sample,
+                    random_state=random_state,
+                    lazy=lazy,
+                    inplace=True,
+                    validation_context=validation_context,
+                )
+            elif (
+                getattr(schema, "drop_invalid_rows", False)
+                and validation_context is None
+            ):
+                # replace the check_obj with the validated. In conditional mode
+                # rows are dropped once, at the end of the whole schema
+                # validation, using physical positions; the column backend only
+                # accumulates failure positions.
+                check_obj = validate_column(
+                    check_obj, column_name, return_check_obj=True
+                )
+                validated_column = check_obj
+            else:
+                validated_column = validate_column(
+                    check_obj,
+                    column_name,
+                    return_check_obj=True,
+                )
+
+            if schema.parsers:
+                if isinstance(validated_column, pd.Series):
+                    check_obj[column_name] = validated_column
+                elif is_table(validated_column):
+                    check_obj[column_name] = validated_column[column_name]
 
         if lazy and error_handler.collected_errors:
             raise SchemaErrors(
@@ -197,6 +239,215 @@ class ColumnBackend(ArraySchemaBackend):
 
         return check_obj
 
+    def _run_column_parsers_safely(
+        self,
+        check_obj,
+        schema,
+        column_name,
+        validation_context,
+        error_handler,
+    ):
+        """Execute a column's parsers, turning any failure into a SchemaError.
+
+        Returns ``(parsed_obj, failure)`` where ``failure`` is ``None`` on
+        success. Every parser runs at most once. The returned ``parsed_obj`` is
+        only valid when ``failure`` is ``None``.
+        """
+        parsed_obj = check_obj
+        for parser_index, parser in enumerate(schema.parsers):
+            before = parsed_obj
+            try:
+                result = self.run_parser(
+                    parsed_obj,
+                    parser,
+                    parser_index,
+                    column_name,
+                )
+            except SchemaError as err:
+                return None, self._column_parser_error(
+                    schema,
+                    check_obj,
+                    column_name,
+                    parser,
+                    parser_index,
+                    err,
+                    validation_context,
+                    error_handler,
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                return None, self._column_parser_error(
+                    schema,
+                    check_obj,
+                    column_name,
+                    parser,
+                    parser_index,
+                    err,
+                    validation_context,
+                    error_handler,
+                )
+            parsed_obj = result.parser_output
+
+            # verify the output keeps a legal row layout. The reference is the
+            # parser's own input: a table output must keep the input table's
+            # rows, a Series output must keep the rows of the Series/column it
+            # was derived from (not necessarily the whole table).
+            try:
+                if not is_table(parsed_obj) and not isinstance(
+                    parsed_obj, pd.Series
+                ):
+                    raise SchemaError(
+                        schema=schema,
+                        data=check_obj,
+                        message=(
+                            f"Column parser "
+                            f"{getattr(parser, 'name', parser_index)!r} "
+                            "must return a pandas Series or DataFrame, got "
+                            f"{type(parsed_obj).__name__}."
+                        ),
+                        failure_cases=type(parsed_obj).__name__,
+                        check=getattr(
+                            parser, "name", f"parser_{parser_index}"
+                        ),
+                        reason_code=SchemaErrorReason.CHECK_ERROR,
+                    )
+                if is_table(parsed_obj):
+                    if is_table(before):
+                        reference = before
+                    else:
+                        # a table produced from a field must keep the table rows
+                        reference = check_obj
+                    if validation_context is not None:
+                        validation_context.assert_parser_preserves_rows(
+                            reference,
+                            parsed_obj,
+                            getattr(parser, "name", f"parser_{parser_index}"),
+                        )
+                    elif (
+                        len(parsed_obj) != len(reference)
+                        or not parsed_obj.index.equals(reference.index)
+                    ):
+                        raise SchemaError(
+                            schema=schema,
+                            data=reference,
+                            message=(
+                                f"Column parser "
+                                f"{getattr(parser, 'name', parser_index)!r} "
+                                "changed the number of rows or the index "
+                                "sequence of column "
+                                f"{column_name!r}."
+                            ),
+                            failure_cases=getattr(
+                                parser, "name", f"parser_{parser_index}"
+                            ),
+                            check=getattr(
+                                parser, "name", f"parser_{parser_index}"
+                            ),
+                            reason_code=SchemaErrorReason.CHECK_ERROR,
+                        )
+                elif isinstance(parsed_obj, pd.Series):
+                    # the parser input is the Series itself on the first hop,
+                    # or whatever object the previous parser returned.
+                    reference_index = (
+                        before.index
+                        if isinstance(before, pd.Series)
+                        else before[column_name].index
+                    )
+                    if len(parsed_obj) != len(reference_index) or not (
+                        parsed_obj.index.equals(reference_index)
+                    ):
+                        raise SchemaError(
+                            schema=schema,
+                            data=check_obj,
+                            message=(
+                                f"Column parser "
+                                f"{getattr(parser, 'name', parser_index)!r} "
+                                "returned a Series with a number of rows or an "
+                                "index sequence that does not match column "
+                                f"{column_name!r}."
+                            ),
+                            failure_cases=getattr(
+                                parser, "name", f"parser_{parser_index}"
+                            ),
+                            check=getattr(
+                                parser, "name", f"parser_{parser_index}"
+                            ),
+                            reason_code=SchemaErrorReason.CHECK_ERROR,
+                        )
+            except SchemaError as err:
+                return None, self._column_parser_error(
+                    schema,
+                    check_obj,
+                    column_name,
+                    parser,
+                    parser_index,
+                    err,
+                    validation_context,
+                    error_handler,
+                )
+        return parsed_obj, None
+
+    def _column_parser_error(
+        self,
+        schema,
+        check_obj,
+        column_name,
+        parser,
+        parser_index,
+        original_exc,
+        validation_context,
+        error_handler,
+    ) -> SchemaError:
+        """Build, collect and return the SchemaError for a failed column parser."""
+        if isinstance(original_exc, SchemaError):
+            exc = original_exc
+            exc.column_name = column_name
+            exc.parser = exc.parser or parser
+            exc.parser_index = (
+                exc.parser_index if exc.parser_index is not None
+                else parser_index
+            )
+            if exc.reason_code is None:
+                exc.reason_code = SchemaErrorReason.CHECK_ERROR
+            reason_code = exc.reason_code
+            chained = getattr(exc, "original_exc", None)
+        else:
+            err_msg = (
+                f'"{original_exc.args[0]}"'
+                if original_exc.args
+                else ""
+            )
+            err_str = f"{original_exc.__class__.__name__}({err_msg})"
+            reason_code = SchemaErrorReason.CHECK_ERROR
+            exc = SchemaError(
+                schema=schema,
+                data=check_obj,
+                message=(
+                    f"Error while executing parser "
+                    f"{getattr(parser, 'name', parser_index)!r} on column "
+                    f"{column_name!r}: {err_str}\n"
+                    f"{traceback.format_exc()}"
+                ),
+                failure_cases=err_str,
+                check=getattr(parser, "name", f"parser_{parser_index}"),
+                parser=parser,
+                parser_index=parser_index,
+                reason_code=reason_code,
+                column_name=column_name,
+                original_exc=original_exc,
+            )
+            chained = original_exc
+
+        # parser failures cannot be repaired by dropping rows and cannot be
+        # attributed to concrete physical rows.
+        error_handler.mark_non_row_error(exc)
+        error_handler.collect_error(
+            validation_type(reason_code),
+            reason_code,
+            exc,
+            chained,
+        )
+        return exc
+
     @staticmethod
     def _check_only_component(schema):
         """Shallow-copy a column schema keeping only its checks."""
@@ -204,56 +455,6 @@ class ColumnBackend(ArraySchemaBackend):
         check_only.parsers = []
         check_only.checks = list(schema.checks)
         return check_only
-
-    def _run_column_parsers(
-        self, check_obj, schema, column_name, validation_context
-    ):
-        """Execute a column's parsers without running its checks.
-
-        Returns the parsed column (Series) or parsed table, asserting that
-        every parser preserved the physical row sequence required for
-        conditional validation.
-        """
-        parsed_obj = check_obj
-        for parser_index, parser in enumerate(schema.parsers):
-            before = parsed_obj
-            result = self.run_parser(
-                parsed_obj,
-                parser,
-                parser_index,
-                column_name,
-            )
-            parsed_obj = result.parser_output
-
-            # compare row count and index sequence at the table level when
-            # possible; a parser that returns a column Series must match the
-            # rows of the table it was derived from.
-            if is_table(parsed_obj):
-                reference_before = before if is_table(before) else check_obj
-                validation_context.assert_parser_preserves_rows(
-                    reference_before,
-                    parsed_obj,
-                    getattr(parser, "name", f"parser_{parser_index}"),
-                )
-            elif isinstance(parsed_obj, pd.Series):
-                reference_index = (
-                    before.index
-                    if is_table(before)
-                    else check_obj.index
-                )
-                if len(parsed_obj) != len(reference_index) or not parsed_obj.index.equals(
-                    reference_index
-                ):
-                    from pandera.errors import SchemaDefinitionError
-
-                    raise SchemaDefinitionError(
-                        f"Column parser {parser_index!r} changed the number "
-                        "of rows or the index sequence while conditional "
-                        "(`where`) checks are enabled. Conditional validation "
-                        "requires column parsers to preserve row count and "
-                        "index order."
-                    )
-        return parsed_obj
 
     def get_regex_columns(self, schema, check_obj) -> Iterable:
         """Get matching column names based on regex column name pattern.
